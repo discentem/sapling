@@ -3,8 +3,10 @@ import logging
 import os
 from typing import Any, Dict, Optional, List
 
+from edenscm import gpg
 import ghstack
 import ghstack.config
+from ghstack.ghs_types import GitCommitHash
 from ghstack.shell import _SHELL_RET
 
 WILDCARD_ARG = {}
@@ -13,14 +15,29 @@ class SaplingShell(ghstack.shell.Shell):
     def __init__(self,
                  *,
                  conf: ghstack.config.Config,
+                 ui = None,  # Sapling ui object.
                  git_dir: str,
+                 user_name: str,
+                 user_email: str,
                  quiet: bool = False,
                  cwd: Optional[str] = None,
                  testing: bool = False,
                  sapling_cli: str = "sl"):
+        """Creates a new Shell that runs Git commands in terms of Sapling
+        commands, as appropriate.
+
+        In order for Sapling to work in the absence of a .gitconfig file,
+        Git commands, such as `git commit-tree`, that expect to read `user.name`
+        and `user.email` from .gitconfig will be invoked by specifying the
+        config values on the command line (with -c) using the `user_name` and
+        `user_email` values passed to this constructor.
+        """
         super().__init__(quiet=quiet, cwd=cwd, testing=testing)
         self.conf = conf
+        self.ui = ui
         self.git_dir = git_dir
+        self.user_name = user_name
+        self.user_email = user_email
         self.sapling_cli = sapling_cli
         logging.debug(f"--git-dir set to: {self.git_dir}")
 
@@ -112,6 +129,20 @@ class SaplingShell(ghstack.shell.Shell):
         # hashes. In our usage, each value should have one item in the list.
         mappings = json.loads(stdout)
         return {k: v[0] for k, v in mappings.items()}
+
+    def git_commit_tree(self, *args, **kwargs: Any  # noqa: F811
+            ) -> GitCommitHash:
+        """Run `git commit-tree`, adding GPG flags, if appropriate.
+        """
+        config_flags = ['-c', f'user.name={self.user_name}', '-c', f'user.email={self.user_email}']
+        keyid = gpg.get_gpg_keyid(self.ui)
+        gpg_args = [f'-S{keyid}'] if keyid else []
+        full_args = config_flags + ["commit-tree"] + gpg_args + list(args)
+        stdout = self.git(*full_args, **kwargs)
+        if isinstance(stdout, str):
+            return GitCommitHash(stdout)
+        else:
+            raise ValueError(f"Unexpected `{' '.join(full_args)}` returned {stdout} using {kwargs}")
 
 
 def match_args(pattern, args: List[str]) -> bool:

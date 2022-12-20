@@ -200,11 +200,18 @@ pub struct MononokeTunables {
     // How often to check if derived data is disabled or not
     derived_data_disabled_watcher_delay_secs: AtomicI64,
 
-    // Disable derivation via direved data service.
-    derived_data_disable_remote_derivation: AtomicBool,
-
     // Stops deriving on derivation workers. Will not drain Derivation Queue
     derived_data_disable_derivation_workers: AtomicBool,
+
+    // How long to wait before worker retries in case of an error
+    // or empty Derivation queue.
+    derivation_worker_sleep_duration: AtomicI64,
+
+    // How long client should wait between polls of Derived data service
+    derivation_request_retry_delay: AtomicI64,
+
+    // Sets the size of the batch for derivaiton.
+    derivation_batch_size: AtomicI64,
 
     // Disable the parallel derivation for DM and default to serial
     deleted_manifest_disable_new_parallel_derivation: AtomicBool,
@@ -328,7 +335,7 @@ pub struct MononokeTunables {
     disable_scs_pushredirect: AtomicBool,
 
     // Enable usage of basename_suffix_skeleton_manifest in commit_find_files
-    enable_basename_suffix_skeleton_manifest: AtomicBool,
+    disable_basename_suffix_skeleton_manifest: AtomicBool,
 
     // List of targets in AOSP megarepo to apply squashing config overrides
     megarepo_squashing_config_override_targets: TunableVecOfStringsByRepo,
@@ -341,6 +348,11 @@ pub struct MononokeTunables {
     disable_sql_auto_retries: AtomicBool,
     // Disable SQL queries being cached using `cacheable` keyword
     disable_sql_auto_cache: AtomicBool,
+    // Disable using rendezvous for batching WAL deletes.
+    // TODO: delete once it using WAL here shows to be stable
+    wal_disable_rendezvous_on_deletes: AtomicBool,
+    // Enable derivation on service per repo
+    enable_remote_derivation: TunableBoolByRepo,
 }
 
 fn log_tunables(tunables: &TunablesStruct) -> String {
@@ -353,14 +365,7 @@ pub fn init_tunables_worker(
     config_handle: ConfigHandle<TunablesStruct>,
     runtime_handle: Handle,
 ) -> Result<()> {
-    let init_tunables = config_handle.get();
-    debug!(
-        logger,
-        "Initializing tunables: {}",
-        log_tunables(&init_tunables)
-    );
-    update_tunables(init_tunables)?;
-
+    init_tunables(&logger, &config_handle)?;
     if TUNABLES_WORKER_STATE
         .set(TunablesWorkerState {
             config_handle,
@@ -373,6 +378,12 @@ pub fn init_tunables_worker(
     runtime_handle.spawn(wait_and_update());
 
     Ok(())
+}
+
+pub fn init_tunables(logger: &Logger, config_handle: &ConfigHandle<TunablesStruct>) -> Result<()> {
+    let tunables = config_handle.get();
+    debug!(logger, "Initializing tunables: {}", log_tunables(&tunables));
+    update_tunables(tunables)
 }
 
 /// Tunables are updated when the underlying config source notifies of a change.

@@ -707,6 +707,12 @@ void EdenServer::updatePeriodicTaskIntervals(const EdenConfig& config) {
   localStoreTask_.updateInterval(
       std::chrono::duration_cast<std::chrono::milliseconds>(
           config.localStoreManagementInterval.getValue()));
+
+  if (config.enableGc.getValue()) {
+    gcTask_.updateInterval(
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            config.gcPeriod.getValue()));
+  }
 }
 
 void EdenServer::scheduleCallbackOnMainEventBase(
@@ -2021,6 +2027,18 @@ folly::Future<TakeoverData> EdenServer::startTakeoverShutdown() {
           enumValue(state->state))));
     }
 
+    if (getMountPoints() != getAllMountPoints()) {
+      return makeFuture<TakeoverData>(std::runtime_error(
+          "can only perform graceful restart when all mount points are initialized"));
+      // TODO(xavierd): There is still a potential race after this check if a
+      // mount is initiated at this point. Injecting a block below and starting
+      // a mount would manifest it. In practice, this should be fairly rare.
+      // Moving this further (in stopMountsForTakeover for instance) to avoid
+      // this race requires EdenFS to being able to gracefully handle failures
+      // and recover in these cases by restarting several components after they
+      // have been already shutdown.
+    }
+
     // Make a copy of the thrift server socket so we can transfer it to the
     // new edenfs process.  Our local thrift will close its own socket when
     // we stop the server.  The easiest way to avoid completely closing the
@@ -2042,6 +2060,7 @@ folly::Future<TakeoverData> EdenServer::startTakeoverShutdown() {
 
   return serverState_->getFaultInjector()
       .checkAsync("takeover", "server_shutdown")
+      .semi()
       .via(serverState_->getThreadPool().get())
       .thenValue([this](auto&&) {
         // Compact storage for all key spaces in order to speed up the
@@ -2174,6 +2193,40 @@ void EdenServer::manageOverlay() {
     const auto& mount = info.edenMount;
 
     mount->getOverlay()->maintenance();
+  }
+}
+
+void EdenServer::workingCopyGC() {
+  auto config = serverState_->getReloadableConfig()->getEdenConfig();
+  auto cutoffConfig =
+      std::chrono::duration_cast<std::chrono::system_clock::duration>(
+          config->gcCutoff.getValue());
+
+  auto cutoff = std::chrono::system_clock::time_point::max();
+  if (cutoffConfig != std::chrono::system_clock::duration::zero()) {
+    cutoff = std::chrono::system_clock::now() - cutoffConfig;
+  }
+
+  const auto mountPoints = getMountPoints();
+  for (const auto& mount : mountPoints) {
+    auto rootInode = mount->getRootInode();
+
+    auto lease = mount->tryStartWorkingCopyGC(rootInode);
+    if (!lease) {
+      XLOG(DBG6) << "Not running GC for: " << mount->getPath()
+                 << ", another GC is already in progress";
+      continue;
+    }
+
+    // Avoid blocking the Thrift EventBase by invalidating on another executor.
+    folly::via(getServerState()->getThreadPool().get(), [rootInode, cutoff] {
+      static auto context = ObjectFetchContext::getNullContextWithCauseDetail(
+          "EdenServer::garbageCollect");
+      return rootInode->invalidateChildrenNotMaterialized(cutoff, context)
+          .semi();
+    }).ensure([rootInode, lease = std::move(lease)] {
+      rootInode->unloadChildrenUnreferencedByFs();
+    });
   }
 }
 

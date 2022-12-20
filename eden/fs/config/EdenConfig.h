@@ -12,7 +12,6 @@
 #include <optional>
 #include <vector>
 
-#include <folly/dynamic.h>
 #include <folly/portability/SysStat.h>
 #include <folly/portability/SysTypes.h>
 #include <folly/portability/Unistd.h>
@@ -20,11 +19,11 @@
 
 #include "common/rust/shed/hostcaps/hostcaps.h"
 #include "eden/fs/config/ConfigSetting.h"
+#include "eden/fs/config/ConfigVariables.h"
 #include "eden/fs/config/FileChangeMonitor.h"
 #include "eden/fs/config/HgObjectIdFormat.h"
 #include "eden/fs/config/MountProtocol.h"
 #include "eden/fs/eden-config.h"
-#include "eden/fs/model/Hash.h"
 #include "eden/fs/utils/PathFuncs.h"
 
 namespace facebook::eden {
@@ -48,8 +47,7 @@ class EdenConfig : private ConfigSettingManager {
    * load methods to populate the EdenConfig.
    */
   explicit EdenConfig(
-      folly::StringPiece userName,
-      uid_t userID,
+      ConfigVariables substitutions,
       AbsolutePath userHomePath,
       AbsolutePath userConfigPath,
       AbsolutePath systemConfigDir,
@@ -86,13 +84,8 @@ class EdenConfig : private ConfigSettingManager {
    */
   void loadConfig(
       AbsolutePathPiece path,
-      ConfigSource configSource,
-      struct stat* configFileStat);
-
-  /**
-   * Stringify the EdenConfig for logging or debugging.
-   */
-  std::string toString() const;
+      ConfigSourceType configSourceType,
+      std::optional<FileStat>& configFileStat);
 
   /**
    * Return the config data as a EdenConfigData structure that can be
@@ -109,23 +102,16 @@ class EdenConfig : private ConfigSettingManager {
   /** Get the user config path. Default "userHomePath/.edenrc" */
   const AbsolutePath& getUserConfigPath() const;
 
-  /** Get the system config dir. Default "/etc/eden" */
-  const AbsolutePath& getSystemConfigDir() const;
-
   /** Get the system config path. Default "/etc/eden/edenfs.rc" */
   const AbsolutePath& getSystemConfigPath() const;
 
   /** Get the path to client certificate. */
   const std::optional<AbsolutePath> getClientCertificate() const;
 
-  void setUserConfigPath(AbsolutePath userConfigPath);
-  void setSystemConfigDir(AbsolutePath systemConfigDir);
-  void setSystemConfigPath(AbsolutePath systemConfigDir);
-
   /**
    * Clear all configuration for the given config source.
    */
-  void clearAll(ConfigSource);
+  void clearAll(ConfigSourceType);
 
   /**
    *  Register the configuration setting. The fullKey is used to parse values
@@ -134,33 +120,24 @@ class EdenConfig : private ConfigSettingManager {
   void registerConfiguration(ConfigSettingBase* configSetting) override;
 
   /**
-   * Returns the user's home directory
-   */
-  AbsolutePathPiece getUserHomePath() const;
-
-  /**
-   * Returns the user's username
-   */
-  const std::string& getUserName() const;
-
-  /**
-   * Returns the user's UID
-   */
-  uid_t getUserID() const;
-
-  /**
    * Returns the value in optional string for the given config key.
    * Throws if the config key is ill-formed.
    */
   std::optional<std::string> getValueByFullKey(
-      folly::StringPiece configKey) const;
+      std::string_view configKey) const;
 
  private:
   /**
-   * Utility method for converting ConfigSource to the filename (or cli).
-   * @return the string value for the ConfigSource.
+   * Utility method for converting ConfigSourceType to the filename (or cli).
+   * @return the string value for the ConfigSourceType.
    */
-  std::string toString(facebook::eden::ConfigSource cs) const;
+  std::string toString(ConfigSourceType cs) const;
+
+  /**
+   * Returns a Thrift-suitable path corresponding to the given source's config
+   * file.
+   */
+  std::string toSourcePath(ConfigSourceType cs) const;
 
   void doCopy(const EdenConfig& source);
 
@@ -169,7 +146,7 @@ class EdenConfig : private ConfigSettingManager {
   void parseAndApplyConfigFile(
       int configFd,
       AbsolutePathPiece configPath,
-      ConfigSource configSource);
+      ConfigSourceType configSourceType);
 
   /**
    * Mapping of section name : (map of attribute : config values). The
@@ -177,15 +154,12 @@ class EdenConfig : private ConfigSettingManager {
    */
   std::map<std::string, std::map<std::string, ConfigSettingBase*>> configMap_;
 
-  std::string userName_;
-  uid_t userID_;
-  AbsolutePath userHomePath_;
+  std::shared_ptr<ConfigVariables> substitutions_;
   AbsolutePath userConfigPath_;
   AbsolutePath systemConfigPath_;
-  AbsolutePath systemConfigDir_;
 
-  struct stat systemConfigFileStat_ {};
-  struct stat userConfigFileStat_ {};
+  std::optional<FileStat> systemConfigFileStat_;
+  std::optional<FileStat> userConfigFileStat_;
 
   /*
    * Settings follow. Their initialization registers themselves with the
@@ -315,6 +289,28 @@ class EdenConfig : private ConfigSettingManager {
   ConfigSetting<uint64_t> numConflictsToLog{
       "mount:num-conflicts-to-log",
       10,
+      this};
+
+  /**
+   * How often will a garbage collection on the working copy will run.
+   *
+   * Default to every hour.
+   */
+  ConfigSetting<std::chrono::nanoseconds> gcPeriod{
+      "mount:garbage-collection-period",
+      std::chrono::hours(1),
+      this};
+
+  /**
+   * Files with an atime older than this will be invalidated during GC.
+   *
+   * Default to a day. A value of 0 will invalidate all non-materialized files.
+   * On Windows, the atime is  updated only once an hour, so values below 1h
+   * may over-invalidate.
+   */
+  ConfigSetting<std::chrono::nanoseconds> gcCutoff{
+      "mount:garbage-collection-cutoff",
+      std::chrono::hours(24),
       this};
 
   // [store]
@@ -775,6 +771,18 @@ class EdenConfig : private ConfigSettingManager {
   ConfigSetting<bool> enableNfsServer{
       "experimental:enable-nfs-server",
       folly::kIsApple,
+      this};
+
+  /**
+   * Controls whether EdenFS will periodically garbage collect the working
+   * directory.
+   *
+   * For now, this really only makes sense on Windows, with unknown behavior on
+   * Linux and macOS.
+   */
+  ConfigSetting<bool> enableGc{
+      "experimental:enable-garbage-collection",
+      false,
       this};
 
   // [treecache]

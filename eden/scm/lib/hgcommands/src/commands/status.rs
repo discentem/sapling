@@ -12,10 +12,9 @@ use std::time::SystemTime;
 
 use anyhow::Result;
 use clidispatch::errors;
-use clidispatch::io::IsTty;
 use clidispatch::ReqCtx;
 use cliparser::define_flags;
-use configparser::configmodel::ConfigExt;
+use configloader::configmodel::ConfigExt;
 use pathmatcher::AlwaysMatcher;
 use print::PrintConfig;
 use print::PrintConfigStatusTypes;
@@ -224,9 +223,7 @@ pub fn run(ctx: ReqCtx<StatusOpts>, repo: &mut Repo, wc: &mut WorkingCopy) -> Re
         Box::new(ctx.io().output()),
     )?;
 
-    if ctx.io().output().is_tty() {
-        ctx.io().start_pager(repo.config())?;
-    }
+    ctx.maybe_start_pager(repo.config())?;
 
     print::print_status(formatter, relativizer, &print_config, &status, &copymap)?;
 

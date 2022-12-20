@@ -14,7 +14,7 @@ def main(pull_request: str,
          ) -> None:
 
     params = ghstack.github_utils.parse_pull_request(pull_request)
-    pr_result = github.graphql("""
+    pr_result = github.graphql_sync("""
         query ($owner: String!, $name: String!, $number: Int!) {
             repository(name: $name, owner: $owner) {
                 id
@@ -39,7 +39,7 @@ def main(pull_request: str,
             repo_id=repo_id,
             ref=orig_ref,
         )['commit']
-        sh.run_sapling_command("update", oid)
+        sh.run_sapling_command("goto", oid)
     else:
         sh.git("fetch", "--prune", remote_name)
         sh.git("checkout", remote_name + "/" + orig_ref)

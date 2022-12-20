@@ -35,7 +35,7 @@ use import_tools::GitimportTarget;
 use linked_hash_map::LinkedHashMap;
 use mercurial_derived_data::get_manifest_from_bonsai;
 use mercurial_derived_data::DeriveHgChangeset;
-use mononoke_api::Mononoke;
+use mononoke_api::BookmarkFreshness;
 use mononoke_app::args::RepoArgs;
 use mononoke_app::fb303::AliveService;
 use mononoke_app::fb303::Fb303AppExtension;
@@ -145,7 +145,7 @@ fn main(fb: FacebookInit) -> Result<(), Error> {
         .with_app_extension(Fb303AppExtension {})
         .build::<GitimportArgs>()?;
 
-    app.run_with_fb303_monitoring(async_main, "gitimport", AliveService)
+    app.run_with_monitoring_and_logging(async_main, "gitimport", AliveService)
 }
 
 async fn async_main(app: MononokeApp) -> Result<(), Error> {
@@ -246,9 +246,11 @@ async fn async_main(app: MononokeApp) -> Result<(), Error> {
         }
         if args.generate_bookmarks {
             let authz = AuthorizationContext::new_bypass_access_control();
-            let repo_context = Mononoke::new(Arc::new(app))
+            let repo_context = app
+                .open_managed_repo_arg(&args.repo_args)
                 .await
                 .context("failed to create mononoke app")?
+                .make_mononoke_api()?
                 .repo_by_id(ctx.clone(), repo.get_repoid())
                 .await
                 .with_context(|| format!("failed to access repo: {}", repo.get_repoid()))?
@@ -261,18 +263,56 @@ async fn async_main(app: MononokeApp) -> Result<(), Error> {
                 .iter()
                 .filter_map(|(name, changeset)| changeset.map(|cs| (name, cs)))
             {
-                let name = name
+                let mut name = name
                     .strip_prefix("refs/")
-                    .context("Ref does not start with refs/")?;
-                repo_context
-                    .create_bookmark(&name, *changeset, None)
+                    .context("Ref does not start with refs/")?
+                    .to_string();
+                if name.starts_with("remotes/origin/") {
+                    name = name.replacen("remotes/origin/", "heads/", 1);
+                };
+                if name.as_str() == "heads/HEAD" {
+                    // Skip the HEAD revision: it shouldn't be imported as a bookmark in mononoke
+                    continue;
+                }
+                let pushvars = None;
+                if repo_context
+                    .create_bookmark(&name, *changeset, pushvars)
                     .await
-                    .with_context(|| {
-                        format!(
-                            "failed to create bookmark: {} for changeset: {:?}",
-                            name, changeset
+                    .is_err()
+                {
+                    let old_changeset = repo_context
+                        .resolve_bookmark(&name, BookmarkFreshness::MostRecent)
+                        .await
+                        .with_context(|| format!("failed to resolve bookmark {name}"))?
+                        .map(|context| context.id());
+                    if old_changeset != Some(*changeset) {
+                        let allow_non_fast_forward = true;
+                        repo_context
+                        .move_bookmark(
+                            &name,
+                            *changeset,
+                            old_changeset,
+                            allow_non_fast_forward,
+                            pushvars,
                         )
-                    })?;
+                        .await
+                        .with_context(|| format!("failed to move bookmark {name} from {old_changeset:?} to {changeset:?}"))?;
+                        info!(
+                            ctx.logger(),
+                            "Bookmark: \"{name}\": {changeset:?} (moved from {old_changeset:?})"
+                        );
+                    } else {
+                        info!(
+                            ctx.logger(),
+                            "Bookmark: \"{name}\": {changeset:?} (already up-to-date)"
+                        );
+                    }
+                } else {
+                    info!(
+                        ctx.logger(),
+                        "Bookmark: \"{name}\": {changeset:?} (created)"
+                    );
+                }
             }
         }
     }

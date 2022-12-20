@@ -40,6 +40,7 @@ import rejectAfterTimeout from 'shared/rejectAfterTimeout';
  */
 
 const GITHUB_TOKEN_PROPERTY = 'github.token';
+const GITHUB_HOSTNAME_PROPERTY = 'github.hostname';
 
 /**
  * This should not be accessed directly: readers and writers must go
@@ -102,10 +103,18 @@ const gitHubPersonalAccessToken = atom<Loadable<string | null>>({
   ],
 });
 
+/**
+ * Before writing this value via `useSetRecoilState()`, ensure that
+ * the `gitHubHostname` atom has been written first.
+ *
+ * TODO(mbolin): Modify this selector so that it takes {token, hostname} as a
+ * pair and change the use of the underlying storage to ensure they are
+ * persisted atomically.
+ */
 export const gitHubTokenPersistence = selector<string | null>({
   key: 'gitHubTokenPersistence',
   get: ({get}) => get(gitHubPersonalAccessToken),
-  set: ({set}, tokenArg) => {
+  set: ({get, set}, tokenArg) => {
     // If DefaultValue is passed in, this called via a reset action, so treat
     // it as if the value were null.
     const token = tokenArg instanceof DefaultValue ? null : tokenArg;
@@ -120,7 +129,15 @@ export const gitHubTokenPersistence = selector<string | null>({
     // - For a user logging in, we do not want to pick up any state written
     //   previously by a potentially nefarious user.
     // - For a user logging out, we want to remove all of their data.
-    const promise: Promise<string | null> = clearAllLocalData().then(() => token);
+    const hostname = get(gitHubHostname);
+    const promise: Promise<string | null> = clearAllLocalData().then(() => {
+      // localStorage was just cleared, so we need to ensure the GitHub hostname
+      // is persisted in localStorage.
+      if (token != null && hostname != null) {
+        localStorage.setItem(GITHUB_HOSTNAME_PROPERTY, hostname);
+      }
+      return token;
+    });
     const loadable = RecoilLoadable.of(promise);
     set(gitHubPersonalAccessToken, loadable);
   },
@@ -196,10 +213,12 @@ export const gitHubUsername = selector<string | null>({
       return username;
     }
 
+    const graphQLEndpoint = get(gitHubGraphQLEndpoint);
     return queryGraphQL<UsernameQueryData, UsernameQueryVariables>(
       UsernameQuery,
       {},
       createRequestHeaders(token),
+      graphQLEndpoint,
     ).then(data => {
       const username = data.viewer.login;
       localStorage.setItem(key, username);
@@ -207,6 +226,53 @@ export const gitHubUsername = selector<string | null>({
     });
   },
 });
+
+export const gitHubHostname = atom<string>({
+  key: 'gitHubHostname',
+  default: localStorage.getItem(GITHUB_HOSTNAME_PROPERTY) || 'github.com',
+});
+
+export const isConsumerGitHub = selector<boolean>({
+  key: 'isConsumerGitHub',
+  get: ({get}) => get(gitHubHostname) === 'github.com',
+});
+
+export const gitHubGraphQLEndpoint = selector<string>({
+  key: 'gitHubGraphQLEndpoint',
+  get: ({get}) => {
+    const hostname = get(gitHubHostname);
+    return createGraphQLEndpointForHostname(hostname);
+  },
+});
+
+export function createGraphQLEndpointForHostname(hostname: string): string {
+  // According to GitHub's documentation:
+  //
+  // https://docs.github.com/en/enterprise-server@3.6/graphql/guides/introduction-to-graphql#discovering-the-graphql-api
+  //
+  // The URL to use for the GraphQL API is:
+  //
+  //   http(s)://HOSTNAME/api/graphql
+  //
+  // Though for the GHE instance we tested, both of these appear to work:
+  //
+  //   https://api.HOSTNAME/graphql
+  //   https://HOSTNAME/api/graphql
+  //
+  // And for consumer GitHub, trying to make API requests using curl:
+  //
+  //   https://api.github.com/graphql works
+  //   https://github.com/api/graphql fails with "Cookies must be enabled to use GitHub."
+  //
+  // While it is possible that https://api.HOSTNAME/graphql always works for
+  // both enterprise and consume GitHub, we'll go with what is documented to
+  // play it safe.
+  if (hostname === 'github.com') {
+    return 'https://api.github.com/graphql';
+  } else {
+    return `https://${hostname}/api/graphql`;
+  }
+}
 
 function deriveLocalStoragePropForUsername(token: string): string {
   return `username.${token}`;

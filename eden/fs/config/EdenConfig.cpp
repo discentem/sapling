@@ -10,26 +10,17 @@
 #include <cpptoml.h>
 #include <array>
 #include <optional>
-#include <sstream>
 
 #include <boost/filesystem.hpp>
 #include <folly/File.h>
 #include <folly/FileUtil.h>
 #include <folly/MapUtil.h>
-#include <folly/Range.h>
 #include <folly/String.h>
-#include <folly/io/Cursor.h>
-#include <folly/json.h>
 #include <folly/logging/xlog.h>
 
-#include "eden/fs/config/FileChangeMonitor.h"
 #include "eden/fs/eden-config.h"
 #include "eden/fs/utils/Bug.h"
 #include "eden/fs/utils/EnumValue.h"
-
-using folly::StringPiece;
-using std::optional;
-using std::string;
 
 namespace facebook::eden {
 
@@ -39,39 +30,32 @@ constexpr PathComponentPiece kDefaultUserIgnoreFile{".edenignore"};
 constexpr PathComponentPiece kDefaultSystemIgnoreFile{"ignore"};
 constexpr PathComponentPiece kDefaultEdenDirectory{".eden"};
 
-template <typename String>
-void toAppend(EdenConfig& ec, String* result) {
-  folly::toAppend(ec.toString(), result);
-}
-
 void getConfigStat(
     AbsolutePathPiece configPath,
     int configFd,
-    struct stat& configStat) {
-  int statRslt{-1};
+    std::optional<FileStat>& configStat) {
   if (configFd >= 0) {
-    statRslt = fstat(configFd, &configStat);
+    auto result = getFileStat(configFd);
     // Report failure that is not due to ENOENT
-    if (statRslt != 0) {
+    if (result.hasError()) {
       XLOG(WARN) << "error accessing config file " << configPath << ": "
-                 << folly::errnoStr(errno);
+                 << folly::errnoStr(result.error());
+      configStat = std::nullopt;
+    } else {
+      configStat = result.value();
     }
-  }
-
-  // We use all 0's to check if a file is created/deleted
-  if (statRslt != 0) {
-    memset(&configStat, 0, sizeof(configStat));
   }
 }
 
-std::pair<StringPiece, StringPiece> parseKey(StringPiece fullKey) {
+std::pair<std::string_view, std::string_view> parseKey(
+    std::string_view fullKey) {
   auto pos = fullKey.find(":");
   if (pos == std::string::npos) {
     EDEN_BUG() << "ConfigSetting key must contain a colon: " << fullKey;
   }
 
-  StringPiece section{fullKey.data(), pos};
-  StringPiece key{fullKey.data() + pos + 1, fullKey.end()};
+  std::string_view section{fullKey.data(), pos};
+  std::string_view key = fullKey.substr(pos + 1);
 
   // Avoid use of locales. Standardize on - instead of _.
   auto isConfigChar = [](char c) {
@@ -93,139 +77,94 @@ std::pair<StringPiece, StringPiece> parseKey(StringPiece fullKey) {
 const AbsolutePath kUnspecifiedDefault{};
 
 std::shared_ptr<EdenConfig> EdenConfig::createTestEdenConfig() {
+  ConfigVariables subst;
+  subst["HOME"] = "/tmp";
+  subst["USER"] = "testuser";
+  subst["USER_ID"] = "0";
+
   return std::make_unique<EdenConfig>(
-      /* userName=*/"testuser",
-      /* userID=*/uid_t{},
+      std::move(subst),
       /* userHomePath=*/canonicalPath("/tmp"),
       /* userConfigPath=*/canonicalPath("/tmp"),
       /* systemConfigDir=*/canonicalPath("/tmp"),
       /* setSystemConfigPath=*/canonicalPath("/tmp"));
 }
 
-std::string EdenConfig::toString(ConfigSource cs) const {
+std::string EdenConfig::toString(ConfigSourceType cs) const {
   switch (cs) {
-    case ConfigSource::Default:
+    case ConfigSourceType::Default:
       return "default";
-    case ConfigSource::CommandLine:
+    case ConfigSourceType::CommandLine:
       return "command-line";
-    case ConfigSource::UserConfig:
+    case ConfigSourceType::UserConfig:
       return userConfigPath_.c_str();
-    case ConfigSource::SystemConfig:
+    case ConfigSourceType::SystemConfig:
       return systemConfigPath_.c_str();
   }
-  throw std::invalid_argument(
-      folly::to<string>("invalid config source value: ", enumValue(cs)));
-}
-
-std::string EdenConfig::toString() const {
-  std::string rslt = fmt::format(
-      "[ EdenConfig settings ]\n"
-      "userConfigPath={}\n"
-      "systemConfigDir={}\n"
-      "systemConfigPath={}\n",
-      userConfigPath_,
-      systemConfigDir_,
-      systemConfigPath_);
-
-  rslt += "[ EdenConfig values ]\n";
-  for (const auto& sectionEntry : configMap_) {
-    auto sectionKey = sectionEntry.first;
-    for (const auto& keyEntry : sectionEntry.second) {
-      rslt += folly::to<std::string>(
-          sectionKey,
-          ":",
-          keyEntry.first,
-          "=",
-          keyEntry.second->getStringValue(),
-          "\n");
-    }
-  }
-  rslt += "[ EdenConfig sources ]\n";
-  for (const auto& sectionEntry : configMap_) {
-    auto sectionKey = sectionEntry.first;
-    for (const auto& keyEntry : sectionEntry.second) {
-      rslt += folly::to<std::string>(
-          sectionKey,
-          ":",
-          keyEntry.first,
-          "=",
-          EdenConfig::toString(keyEntry.second->getSource()),
-          "\n");
-    }
-  }
-  rslt += "]\n";
-  return rslt;
+  throwf<std::invalid_argument>(
+      "invalid config source value: {}", enumValue(cs));
 }
 
 EdenConfigData EdenConfig::toThriftConfigData() const {
   EdenConfigData result;
-  for (const auto& sectionEntry : configMap_) {
-    const auto& sectionKey = sectionEntry.first;
-    for (const auto& keyEntry : sectionEntry.second) {
-      auto keyName = folly::to<string>(sectionKey, ":", keyEntry.first);
+  for (const auto& [sectionName, section] : configMap_) {
+    for (const auto& [key, setting] : section) {
+      auto keyName = fmt::format("{}:{}", sectionName, key);
       auto& configValue = result.values_ref()[keyName];
-      *configValue.parsedValue_ref() = keyEntry.second->getStringValue();
-      *configValue.source_ref() = keyEntry.second->getSource();
+      configValue.parsedValue() = setting->getStringValue();
+      configValue.sourceType() = setting->getSourceType();
+      configValue.sourcePath() = toSourcePath(setting->getSourceType());
     }
   }
   return result;
 }
 
+std::string EdenConfig::toSourcePath(ConfigSourceType cs) const {
+  switch (cs) {
+    case ConfigSourceType::Default:
+      return {};
+    case ConfigSourceType::SystemConfig:
+      return absolutePathToThrift(systemConfigPath_);
+    case ConfigSourceType::UserConfig:
+      return absolutePathToThrift(userConfigPath_);
+    case ConfigSourceType::CommandLine:
+      return {};
+  }
+  return {};
+}
+
 EdenConfig::EdenConfig(
-    folly::StringPiece userName,
-    uid_t userID,
+    ConfigVariables substitutions,
     AbsolutePath userHomePath,
     AbsolutePath userConfigPath,
     AbsolutePath systemConfigDir,
     AbsolutePath systemConfigPath)
-    : userName_(userName),
-      userID_(userID),
-      userHomePath_(userHomePath),
-      userConfigPath_(userConfigPath),
-      systemConfigPath_(systemConfigPath),
-      systemConfigDir_(systemConfigDir) {
+    : substitutions_{std::make_shared<ConfigVariables>(
+          std::move(substitutions))},
+      userConfigPath_{std::move(userConfigPath)},
+      systemConfigPath_{std::move(systemConfigPath)} {
   // Force set defaults that require passed arguments
   edenDir.setValue(
-      userHomePath_ + kDefaultEdenDirectory, ConfigSource::Default, true);
+      userHomePath + kDefaultEdenDirectory, ConfigSourceType::Default, true);
   userIgnoreFile.setValue(
-      userHomePath + kDefaultUserIgnoreFile, ConfigSource::Default, true);
+      userHomePath + kDefaultUserIgnoreFile, ConfigSourceType::Default, true);
   systemIgnoreFile.setValue(
-      systemConfigDir_ + kDefaultSystemIgnoreFile, ConfigSource::Default, true);
-
-  // I have observed Clang on macOS (Xcode 11.6.0) not zero-initialize
-  // padding in these members, even though they should be
-  // zero-initialized. Explicitly zero.  (Technically, none of this
-  // code relies on the padding bits of these stat() results being
-  // zeroed, but since we assert it elsewhere to catch bugs,
-  // explicitly zero here to be consistent. Another option would be to
-  // use std::optional.)
-  memset(&systemConfigFileStat_, 0, sizeof(systemConfigFileStat_));
-  memset(&userConfigFileStat_, 0, sizeof(userConfigFileStat_));
+      systemConfigDir + kDefaultSystemIgnoreFile,
+      ConfigSourceType::Default,
+      true);
 }
 
 EdenConfig::EdenConfig(const EdenConfig& source) {
   doCopy(source);
 }
 
-AbsolutePathPiece EdenConfig::getUserHomePath() const {
-  return userHomePath_;
-}
-
-const std::string& EdenConfig::getUserName() const {
-  return userName_;
-}
-
-uid_t EdenConfig::getUserID() const {
-  return userID_;
-}
-
 std::optional<std::string> EdenConfig::getValueByFullKey(
-    folly::StringPiece configKey) const {
+    std::string_view configKey) const {
   // Throws if the config key is ill-formed.
   auto [sectionKey, entryKey] = parseKey(configKey);
 
-  if (auto* entry =
-          folly::get_ptr(configMap_, sectionKey.str(), entryKey.str())) {
+  if (auto* entry = folly::get_ptr(
+          configMap_, std::string{sectionKey}, std::string{entryKey})) {
     return (*entry)->getStringValue();
   }
 
@@ -238,12 +177,9 @@ EdenConfig& EdenConfig::operator=(const EdenConfig& source) {
 }
 
 void EdenConfig::doCopy(const EdenConfig& source) {
-  userName_ = source.userName_;
-  userID_ = source.userID_;
-  userHomePath_ = source.userHomePath_;
+  substitutions_ = source.substitutions_;
   userConfigPath_ = source.userConfigPath_;
   systemConfigPath_ = source.systemConfigPath_;
-  systemConfigDir_ = source.systemConfigDir_;
 
   systemConfigFileStat_ = source.systemConfigFileStat_;
   userConfigFileStat_ = source.userConfigFileStat_;
@@ -261,14 +197,14 @@ void EdenConfig::doCopy(const EdenConfig& source) {
 }
 
 void EdenConfig::registerConfiguration(ConfigSettingBase* configSetting) {
-  StringPiece fullKeyStr = configSetting->getConfigKey();
+  std::string_view fullKeyStr = configSetting->getConfigKey();
   auto [section, key] = parseKey(fullKeyStr);
 
-  auto& keyMap = configMap_[section.str()];
-  keyMap[key.str()] = configSetting;
+  auto& keyMap = configMap_[std::string{section}];
+  keyMap[std::string{key}] = configSetting;
 }
 
-const optional<AbsolutePath> EdenConfig::getClientCertificate() const {
+const std::optional<AbsolutePath> EdenConfig::getClientCertificate() const {
   // return the first cert path that exists
   for (auto& cert : clientCertificateLocations.getValue()) {
     if (boost::filesystem::exists(cert.asString())) {
@@ -282,38 +218,35 @@ const optional<AbsolutePath> EdenConfig::getClientCertificate() const {
   return std::nullopt;
 }
 
-void EdenConfig::setUserConfigPath(AbsolutePath userConfigPath) {
-  userConfigPath_ = userConfigPath;
-}
-void EdenConfig::setSystemConfigDir(AbsolutePath systemConfigDir) {
-  systemConfigDir_ = systemConfigDir;
-}
-void EdenConfig::setSystemConfigPath(AbsolutePath systemConfigPath) {
-  systemConfigPath_ = systemConfigPath;
-}
-
 namespace {
 FileChangeReason hasConfigFileChanged(
     AbsolutePath configFileName,
-    const struct stat& oldStat) {
-  struct stat currentStat;
-
+    const std::optional<FileStat>& oldStat) {
   // We are using stat to check for file deltas. Since we don't open file,
   // there is no chance of TOCTOU attack.
-  int rslt = stat(configFileName.c_str(), &currentStat);
+  std::optional<FileStat> currentStat;
+  auto result = getFileStat(configFileName.c_str());
 
   // Treat config file as if not present on error.
   // Log error if not ENOENT as they are unexpected and useful for debugging.
-  if (rslt != 0) {
-    if (errno != ENOENT) {
+  if (result.hasError()) {
+    if (result.error() != ENOENT) {
       XLOG(WARN) << "error accessing config file " << configFileName << ": "
-                 << folly::errnoStr(errno);
+                 << folly::errnoStr(result.error());
     }
-    // We use all 0's to check if a file is created/deleted
-    memset(&currentStat, 0, sizeof(currentStat));
+  } else {
+    currentStat = result.value();
   }
 
-  return hasFileChanged(currentStat, oldStat);
+  if (oldStat && currentStat) {
+    return hasFileChanged(*oldStat, *currentStat);
+  } else if (oldStat) {
+    return FileChangeReason::SIZE;
+  } else if (currentStat) {
+    return FileChangeReason::SIZE;
+  } else {
+    return FileChangeReason::NONE;
+  }
 }
 } // namespace
 
@@ -333,11 +266,7 @@ const AbsolutePath& EdenConfig::getSystemConfigPath() const {
   return systemConfigPath_;
 }
 
-const AbsolutePath& EdenConfig::getSystemConfigDir() const {
-  return systemConfigDir_;
-}
-
-void EdenConfig::clearAll(ConfigSource configSource) {
+void EdenConfig::clearAll(ConfigSourceType configSource) {
   for (const auto& sectionEntry : configMap_) {
     for (auto& keyEntry : sectionEntry.second) {
       keyEntry.second->clearValue(configSource);
@@ -346,21 +275,21 @@ void EdenConfig::clearAll(ConfigSource configSource) {
 }
 
 void EdenConfig::loadSystemConfig() {
-  clearAll(ConfigSource::SystemConfig);
+  clearAll(ConfigSourceType::SystemConfig);
   loadConfig(
-      systemConfigPath_, ConfigSource::SystemConfig, &systemConfigFileStat_);
+      systemConfigPath_, ConfigSourceType::SystemConfig, systemConfigFileStat_);
 }
 
 void EdenConfig::loadUserConfig() {
-  clearAll(ConfigSource::UserConfig);
-  loadConfig(userConfigPath_, ConfigSource::UserConfig, &userConfigFileStat_);
+  clearAll(ConfigSourceType::UserConfig);
+  loadConfig(
+      userConfigPath_, ConfigSourceType::UserConfig, userConfigFileStat_);
 }
 
 void EdenConfig::loadConfig(
     AbsolutePathPiece path,
-    ConfigSource configSource,
-    struct stat* configFileStat) {
-  struct stat configStat;
+    ConfigSourceType configSource,
+    std::optional<FileStat>& configFileStat) {
   // Load the config path and update its stat information
   auto configFd = open(path.copy().c_str(), O_RDONLY);
   if (configFd < 0) {
@@ -368,17 +297,16 @@ void EdenConfig::loadConfig(
       XLOG(WARN) << "error accessing config file " << path << ": "
                  << folly::errnoStr(errno);
     }
+    // TODO: If a config is deleted from underneath, should we clear configs
+    // from that file?
+    configFileStat = std::nullopt;
+    return;
   }
-  getConfigStat(path, configFd, configStat);
-  memcpy(configFileStat, &configStat, sizeof(struct stat));
+  folly::File configFile(configFd, /*ownsFd=*/true);
+  getConfigStat(path, configFile.fd(), configFileStat);
   if (configFd >= 0) {
     parseAndApplyConfigFile(configFd, path, configSource);
   }
-  SCOPE_EXIT {
-    if (configFd >= 0) {
-      close(configFd);
-    }
-  };
 }
 
 namespace {
@@ -417,15 +345,8 @@ cpptoml::option<std::string> itemAsString(
 void EdenConfig::parseAndApplyConfigFile(
     int configFd,
     AbsolutePathPiece configPath,
-    ConfigSource configSource) {
+    ConfigSourceType configSource) {
   std::shared_ptr<cpptoml::table> configRoot;
-  std::map<std::string, std::string> attrMap;
-  attrMap["HOME"] = userHomePath_.value();
-  attrMap["USER"] = userName_;
-  attrMap["USER_ID"] = std::to_string(userID_);
-  if (auto certPath = std::getenv("THRIFT_TLS_CL_CERT_PATH")) {
-    attrMap["THRIFT_TLS_CL_CERT_PATH"] = certPath;
-  }
 
   try {
     std::string fileContents;
@@ -466,7 +387,7 @@ void EdenConfig::parseAndApplyConfigFile(
         auto valueStr = itemAsString(currSection, entryKey);
         if (valueStr) {
           auto rslt = configMapKeyEntry->second->setStringValue(
-              *valueStr, attrMap, configSource);
+              *valueStr, *substitutions_, configSource);
           if (rslt.hasError()) {
             XLOG(WARNING) << "Ignoring invalid config entry " << configPath
                           << " " << sectionName << ":" << entryKey

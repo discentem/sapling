@@ -48,9 +48,6 @@ function urlencode {
 REPOID=0
 REPONAME=${REPONAME:-repo}
 
-# Disable OSS hg configs during hg builds.
-export HG_NO_DEFAULT_CONFIG=true
-
 # Where we write host:port information after servers bind to :0
 MONONOKE_SERVER_ADDR_FILE="$TESTTMP/mononoke_server_addr.txt"
 
@@ -1296,6 +1293,11 @@ function s_client {
 }
 
 function scs {
+  SCRIBE_LOGS_DIR="$TESTTMP/scribe_logs"
+  if [[ ! -d "$SCRIBE_LOGS_DIR" ]]; then
+    mkdir "$SCRIBE_LOGS_DIR"
+  fi
+
   rm -f "$TESTTMP/scs_server_addr.txt"
   GLOG_minloglevel=5 \
     THRIFT_TLS_SRV_CERT="$TEST_CERTDIR/localhost.crt" \
@@ -1308,6 +1310,7 @@ function scs {
     --log-level DEBUG \
     --mononoke-config-path "$TESTTMP/mononoke-config" \
     --bound-address-file "$TESTTMP/scs_server_addr.txt" \
+    --scribe-logging-directory "$TESTTMP/scribe_logs" \
     "${COMMON_ARGS[@]}" >> "$TESTTMP/scs_server.out" 2>&1 &
   export SCS_SERVER_PID=$!
   echo "$SCS_SERVER_PID" >> "$DAEMON_PIDS"
@@ -2223,4 +2226,18 @@ function testtool_drawdag() {
   # shellcheck disable=SC2046,SC2163,SC2086
   export $out
   return "$rc"
+}
+
+function start_zelos_server() {
+  PORT=$1
+  rm -f "$TESTTMP/local-zelos"
+  "$ZELOSCLI" --x server "$PORT" "$TESTTMP/local-zelos" > /dev/null 2>&1 &
+  pid=$!
+  echo "$pid" >> "$DAEMON_PIDS"
+}
+
+function zeloscli() {
+  PORT=$1
+  shift
+  "$ZELOSCLI" --server localhost:"$PORT" -x "$@" 2>/dev/null
 }

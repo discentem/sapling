@@ -20,6 +20,7 @@ import type {
   MergeConflicts,
   MergeConflictsEvent,
   RepositoryError,
+  PlatformSpecificClientToServerMessages,
 } from 'isl/src/types';
 
 import {browserServerPlatform} from './serverPlatform';
@@ -138,9 +139,27 @@ export default class ServerToClientAPI {
 
   private handleIncomingMessage(data: IncomingMessage) {
     this.handleIncomingGeneralMessage(data as GeneralMessage);
-    if (this.currentState.type === 'repo') {
-      const {repo, cwd} = this.currentState;
-      this.handleIncomingMessageWithRepo(data as WithRepoMessage, repo, cwd);
+    const {currentState} = this;
+    switch (currentState.type) {
+      case 'repo': {
+        const {repo, cwd} = currentState;
+        this.handleIncomingMessageWithRepo(data as WithRepoMessage, repo, cwd);
+        break;
+      }
+
+      // If the repo is in the loading or error state, the client may still send
+      // platform messages such as `platform/openExternal` that should be processed.
+      case 'loading':
+      case 'error':
+        if (data.type.startsWith('platform/')) {
+          this.platform.handleMessageFromClient(
+            /*repo=*/ undefined,
+            data as PlatformSpecificClientToServerMessages,
+            message => this.postMessage(message),
+          );
+          this.notifyListeners(data);
+        }
+        break;
     }
   }
 
@@ -171,10 +190,10 @@ export default class ServerToClientAPI {
    * Handle messages which require a repository to have been successfully set up to run
    */
   private handleIncomingMessageWithRepo(data: WithRepoMessage, repo: Repository, cwd: string) {
-    const logger = repo.logger;
+    const {logger} = repo;
     switch (data.type) {
       case 'subscribeUncommittedChanges': {
-        if (this.hasSubscribedToUncommittedChanges || repo == null) {
+        if (this.hasSubscribedToUncommittedChanges) {
           break;
         }
         this.hasSubscribedToUncommittedChanges = true;
@@ -359,10 +378,13 @@ export default class ServerToClientAPI {
       }
     }
 
+    this.notifyListeners(data);
+  }
+
+  private notifyListeners(data: IncomingMessage): void {
     const listeners = this.listenersByType.get(data.type);
-    if (!listeners) {
-      return;
+    if (listeners) {
+      listeners.forEach(handle => handle(data));
     }
-    listeners.forEach(handle => handle(data));
   }
 }

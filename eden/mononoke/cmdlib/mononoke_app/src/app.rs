@@ -8,16 +8,17 @@
 use std::any::TypeId;
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::fs;
 use std::future::Future;
+use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 use std::time::Instant;
 
 use anyhow::anyhow;
-use anyhow::format_err;
+use anyhow::bail;
 use anyhow::Context;
-use anyhow::Error;
 use anyhow::Result;
-use async_trait::async_trait;
 use base_app::BaseApp;
 use blobstore::Blobstore;
 use blobstore_factory::BlobstoreOptions;
@@ -26,6 +27,7 @@ use cached_config::ConfigStore;
 use clap::ArgMatches;
 use clap::Error as ClapError;
 use clap::FromArgMatches;
+use cmdlib_running::run_until_terminated;
 use context::CoreContext;
 use environment::MononokeEnvironment;
 use facet::AsyncBuildable;
@@ -34,16 +36,13 @@ use futures::stream;
 use futures::stream::StreamExt;
 use futures::stream::TryStreamExt;
 use futures_util::try_join;
-use itertools::Itertools;
 use metaconfig_parser::RepoConfigs;
 use metaconfig_parser::StorageConfigs;
 use metaconfig_types::BlobConfig;
 use metaconfig_types::BlobstoreId;
 use metaconfig_types::Redaction;
 use metaconfig_types::RepoConfig;
-use mononoke_configs::ConfigUpdateReceiver;
 use mononoke_configs::MononokeConfigs;
-use mononoke_repos::MononokeRepos;
 use mononoke_types::RepositoryId;
 use prefixblob::PrefixBlobstore;
 use redactedblobstore::RedactedBlobstore;
@@ -62,6 +61,7 @@ use stats::prelude::*;
 #[cfg(not(test))]
 use stats::schedule_stats_aggregation_preview;
 use tokio::runtime::Handle;
+use tokio::sync::oneshot;
 
 use crate::args::AsRepoArg;
 use crate::args::ConfigArgs;
@@ -74,85 +74,11 @@ use crate::extension::AppExtension;
 use crate::extension::AppExtensionArgsBox;
 use crate::extension::BoxedAppExtensionArgs;
 use crate::fb303::Fb303AppExtension;
+use crate::repos_manager::MononokeReposManager;
 
 define_stats! {
     prefix = "mononoke.app";
-    initialization_time_millisecs: dynamic_timeseries(
-        "initialization_time_millisecs.{}",
-        (reponame: String);
-        Average, Sum, Count
-    ),
-}
-
-/// Struct responsible for receiving updated configurations from MononokeConfigs
-/// and refreshing repos (and related entities) based on the update.
-pub struct MononokeConfigUpdateReceiver<Repo> {
-    repos: Arc<MononokeRepos<Repo>>,
-    repo_factory: RepoFactory,
-    logger: Logger,
-}
-
-impl<Repo> MononokeConfigUpdateReceiver<Repo> {
-    fn new(repos: Arc<MononokeRepos<Repo>>, app: &MononokeApp) -> Self {
-        Self {
-            repos,
-            repo_factory: app.repo_factory(),
-            logger: app.logger().clone(),
-        }
-    }
-}
-
-#[async_trait]
-impl<Repo> ConfigUpdateReceiver for MononokeConfigUpdateReceiver<Repo>
-where
-    Repo: for<'builder> AsyncBuildable<'builder, RepoFactoryBuilder<'builder>> + Send + Sync,
-{
-    async fn apply_update(
-        &self,
-        repo_configs: Arc<RepoConfigs>,
-        _: Arc<StorageConfigs>,
-    ) -> Result<()> {
-        // We need to filter out the name of repos that are present in MononokeRepos (i.e.
-        // currently served by the server) but not in RepoConfigs. This situation can happen
-        // when the name of the repo changes (e.g. whatsapp/server.mirror renamed to whatsapp/server)
-        // or when a repo is added or removed. In such a case, reloading of the repo with the old name
-        // would not be possible based on the new configs.
-        let repos_input = stream::iter(self.repos.iter_names().filter_map(|repo_name| {
-            repo_configs
-                .repos
-                .get(&repo_name)
-                .cloned()
-                .map(|repo_config| (repo_name, repo_config))
-        }))
-        .map(|(repo_name, repo_config)| {
-            let repo_factory = self.repo_factory.clone();
-            let name = repo_name.clone();
-            let logger = self.logger.clone();
-            let common_config = repo_configs.common.clone();
-            async move {
-                let repo_id = repo_config.repoid.id();
-                info!(logger, "Reloading repo: {}", &repo_name);
-                let repo = repo_factory
-                    .build(name, repo_config, common_config)
-                    .await
-                    .with_context(|| format!("Failed to reload repo '{}'", &repo_name))?;
-                info!(logger, "Reloaded repo: {}", &repo_name);
-
-                Ok::<_, Error>((repo_id, repo_name, repo))
-            }
-        })
-        // Repo construction can be heavy, 30 at a time is sufficient.
-        .buffered(30)
-        .collect::<Vec<_>>();
-        // There are lots of deep FuturesUnordered here that have caused inefficient polling with
-        // Tokio coop in the past.
-        let repos_input = tokio::task::unconstrained(repos_input)
-            .await
-            .into_iter()
-            .collect::<Result<Vec<_>>>()?;
-        self.repos.populate(repos_input);
-        Ok(())
-    }
+    completion_duration_secs: timeseries(Average, Sum, Count),
 }
 
 pub struct MononokeApp {
@@ -161,8 +87,8 @@ pub struct MononokeApp {
     args: ArgMatches,
     env: Arc<MononokeEnvironment>,
     extension_args: HashMap<TypeId, Box<dyn BoxedAppExtensionArgs>>,
-    configs: MononokeConfigs,
-    repo_factory: RepoFactory,
+    configs: Arc<MononokeConfigs>,
+    repo_factory: Arc<RepoFactory>,
 }
 
 impl BaseApp for MononokeApp {
@@ -182,14 +108,14 @@ impl MononokeApp {
         let env = Arc::new(env);
         let config_path = ConfigArgs::from_arg_matches(&args)?.config_path();
         let config_store = &env.as_ref().config_store;
-        let configs = MononokeConfigs::new(
+        let configs = Arc::new(MononokeConfigs::new(
             config_path,
             config_store,
             env.runtime.handle().clone(),
             env.logger.clone(),
-        )?;
+        )?);
 
-        let repo_factory = RepoFactory::new(env.clone());
+        let repo_factory = Arc::new(RepoFactory::new(env.clone()));
 
         Ok(MononokeApp {
             fb,
@@ -217,11 +143,34 @@ impl MononokeApp {
         ))
     }
 
+    /// Start the FB303 monitoring server for the provided service.
+    pub fn start_monitoring<Service>(&self, app_name: &str, service: Service) -> Result<()>
+    where
+        Service: Fb303Service + Sync + Send + 'static,
+    {
+        let fb303_args = self.extension_args::<Fb303AppExtension>()?;
+        fb303_args.start_fb303_server(self.fb, app_name, self.logger(), service)?;
+        Ok(())
+    }
+
+    /// Start the background stats aggregation thread.
+    pub fn start_stats_aggregation(&self) -> Result<()> {
+        #[cfg(not(test))]
+        {
+            self.env.runtime.block_on(async move {
+                let stats_aggregation = schedule_stats_aggregation_preview()
+                    .map_err(|_| anyhow!("Failed to create stats aggregation worker"))?;
+                tokio::task::spawn(stats_aggregation);
+                anyhow::Ok(())
+            })?;
+        }
+        Ok(())
+    }
+
     /// Execute a future on this app's runtime.
     ///
-    /// This command doesn't provide anything mnore than executiing the provided future
-    /// it won't handle things like fb303 data collection, it's not a drop-in replacement
-    /// for cmdlib::block_execute (run_with_fb303_monitoring will do better here).
+    /// If you are looking for a replacement for `cmdlib::helpers::block_execute`, prefer
+    /// `run_with_monitoring_and_logging`.
     pub fn run_basic<F, Fut>(self, main: F) -> Result<()>
     where
         F: Fn(MononokeApp) -> Fut,
@@ -232,41 +181,122 @@ impl MononokeApp {
             .block_on(async move { tokio::spawn(main(self)).await? })
     }
 
-    /// Execute a future on this app's runtime and start fb303 monitoring
-    /// service for the app.
-    pub fn run_with_fb303_monitoring<F, Fut, S: Fb303Service + Sync + Send + 'static>(
+    /// Execute a future on this app's runtime.
+    ///
+    /// This future will run with monitoring enabled, and errors will be logged to glog.
+    pub fn run_with_monitoring_and_logging<F, Fut, Service>(
         self,
         main: F,
         app_name: &str,
-        service: S,
+        service: Service,
     ) -> Result<()>
     where
         F: Fn(MononokeApp) -> Fut,
         Fut: Future<Output = Result<()>>,
+        Service: Fb303Service + Sync + Send + 'static,
     {
+        self.start_monitoring(app_name, service)?;
+        self.start_stats_aggregation()?;
+
         let env = self.env.clone();
         let logger = self.logger().clone();
-        let fb303_args = self.extension_args::<Fb303AppExtension>()?;
-        fb303_args.start_fb303_server(self.fb, app_name, self.logger(), service)?;
-        let result = env.runtime.block_on(async move {
-            #[cfg(not(test))]
-            {
-                let stats_agg = schedule_stats_aggregation_preview()
-                    .map_err(|_| Error::msg("Failed to create stats aggregation worker"))?;
-                // Note: this returns a JoinHandle, which we drop, thus detaching the task
-                // It thus does not count towards shutdown_on_idle below
-                tokio::task::spawn(stats_agg);
-            }
+        let result = env.runtime.block_on(main(self));
 
-            main(self).await
-        });
-
-        // Log error in glog format (main will log, but not with glog)
-        result.map_err(move |e| {
+        if let Err(e) = result {
+            // Log error in glog format
             error!(&logger, "Execution error: {:?}", e);
-            // Shorten the error that main will print, given that already printed in glog form
-            format_err!("Execution failed")
-        })
+
+            // Replace the error with a simple error so it isn't logged twice.
+            return Err(anyhow!("Execution failed"));
+        }
+
+        Ok(())
+    }
+
+    /// Run a server future, and wait until a termination signal is received.
+    ///
+    /// When the termination signal is received, the `quiesce` callback is
+    /// called.  This should perform any steps required to quiesce the server,
+    /// for example by removing this instance from routing configuration, or
+    /// asking the load balancer to stop sending requests to this instance.
+    /// Requests that do arrive should still be accepted.
+    ///
+    /// After the `shutdown_grace_period`, the `shutdown` future is awaited.
+    /// This should do any additional work to stop accepting connections and wait
+    /// until all outstanding requests have been handled. The `server` future
+    /// continues to run while `shutdown` is being awaited.
+    ///
+    /// Once both `shutdown` and `server` have completed, the process
+    /// exits. If `shutdown_timeout` is exceeded, the server future is canceled
+    /// and an error is returned.
+    pub fn run_until_terminated<ServerFn, ServerFut, QuiesceFn, ShutdownFut>(
+        self,
+        server: ServerFn,
+        quiesce: QuiesceFn,
+        shutdown_grace_period: Duration,
+        shutdown: ShutdownFut,
+        shutdown_timeout: Duration,
+    ) -> Result<()>
+    where
+        ServerFn: FnOnce(MononokeApp) -> ServerFut + Send + 'static,
+        ServerFut: Future<Output = Result<()>> + Send + 'static,
+        QuiesceFn: FnOnce(),
+        ShutdownFut: Future<Output = ()>,
+    {
+        let logger = self.logger().clone();
+        // We must ensure the runtime (in the environment) outlives the
+        // execution of the server future on the runtime.  If we drop the
+        // runtime from within a future that is executing on the runtime, then
+        // the runtime will panic. Keep a copy of the environment in this
+        // function to ensure the runtime is kept alive.
+        // TODO(mbthomas): decouple runtime from environment so this isn't necessary
+        let env = self.env.clone();
+        let server = async move { server(self).await };
+        env.runtime.block_on(run_until_terminated(
+            server,
+            &logger,
+            quiesce,
+            shutdown_grace_period,
+            shutdown,
+            shutdown_timeout,
+        ))
+    }
+
+    /// Wait until a termination signal is received.
+    ///
+    /// This method does not have a server future, and so is useful when all
+    /// serving listeners are running on another executor (e.g. a C++
+    /// executor for a thrift service).
+    ///
+    /// When the termination signal is received, the same quiesce-shutdown
+    /// procedure as for `run_until_terminated` is followed.
+    pub fn wait_until_terminated<QuiesceFn, ShutdownFut>(
+        self,
+        quiesce: QuiesceFn,
+        shutdown_grace_period: Duration,
+        shutdown: ShutdownFut,
+        shutdown_timeout: Duration,
+    ) -> Result<()>
+    where
+        QuiesceFn: FnOnce(),
+        ShutdownFut: Future<Output = ()>,
+    {
+        let (exit_tx, exit_rx) = oneshot::channel();
+        let server = move |_app| async move {
+            exit_rx.await?;
+            Ok(())
+        };
+
+        self.run_until_terminated(
+            server,
+            || {
+                let _ = exit_tx.send(());
+                quiesce();
+            },
+            shutdown_grace_period,
+            shutdown,
+            shutdown_timeout,
+        )
     }
 
     /// Returns the selected subcommand of the app (if this app
@@ -274,6 +304,7 @@ impl MononokeApp {
     pub fn matches(&self) -> &ArgMatches {
         &self.args
     }
+
     /// Returns a parsed args struct based on the arguments provided
     /// on the command line.
     pub fn args<Args>(&self) -> Result<Args, ClapError>
@@ -337,8 +368,8 @@ impl MononokeApp {
     }
 
     /// Return repo factory used by app.
-    pub fn repo_factory(&self) -> RepoFactory {
-        self.repo_factory.clone()
+    pub fn repo_factory(&self) -> &Arc<RepoFactory> {
+        &self.repo_factory
     }
 
     /// Mononoke environment for this app.
@@ -435,113 +466,44 @@ impl MononokeApp {
         Ok(repo)
     }
 
-    async fn populate_repos<Repo, Names>(
-        &self,
-        mononoke_repos: &MononokeRepos<Repo>,
-        repo_names: Names,
-    ) -> Result<()>
-    where
-        Names: IntoIterator<Item = String>,
-        Repo: for<'builder> AsyncBuildable<'builder, RepoFactoryBuilder<'builder>>,
-    {
-        let repos_input = stream::iter(repo_names.into_iter().unique())
-            .map(|repo_name| {
-                let repo_factory = self.repo_factory.clone();
-                let name = repo_name.clone();
-                async move {
-                    let start = Instant::now();
-                    let logger = self.logger();
-                    let repo_config = self.repo_config_by_name(&repo_name)?;
-                    let common_config = self.repo_configs().common.clone();
-                    let repo_id = repo_config.repoid.id();
-                    info!(logger, "Initializing repo: {}", &repo_name);
-                    let repo = repo_factory
-                        .build(name, repo_config, common_config)
-                        .await
-                        .with_context(|| format!("Failed to initialize repo '{}'", &repo_name))?;
-                    info!(logger, "Initialized repo: {}", &repo_name);
-                    STATS::initialization_time_millisecs.add_value(
-                        start.elapsed().as_millis().try_into().unwrap_or(i64::MAX),
-                        (repo_name.to_string(),),
-                    );
-                    Ok::<_, Error>((repo_id, repo_name, repo))
-                }
-            })
-            // Repo construction can be heavy, 30 at a time is sufficient.
-            .buffered(30)
-            .collect::<Vec<_>>();
-        // There are lots of deep FuturesUnordered here that have caused inefficient polling with
-        // Tokio coop in the past.
-        let repos_input = tokio::task::unconstrained(repos_input)
-            .await
-            .into_iter()
-            .collect::<Result<Vec<_>>>()?;
-        mononoke_repos.populate(repos_input);
-        Ok(())
-    }
-
-    /// Method responsible for constructing repos corresponding to the input
-    /// repo-names and populating MononokeRepos with the result. This method
-    /// should be used if dynamically reloadable repos (with configs) are
-    /// needed. For fixed set of repos, use open_repo or open_repos.
-    pub async fn open_mononoke_repos<Repo, Names>(
-        &self,
-        repo_names: Names,
-    ) -> Result<Arc<MononokeRepos<Repo>>>
-    where
-        Names: IntoIterator<Item = String>,
-        Repo: for<'builder> AsyncBuildable<'builder, RepoFactoryBuilder<'builder>>
-            + Send
-            + Sync
-            + 'static,
-    {
-        let mononoke_repos = MononokeRepos::new();
-        self.populate_repos(&mononoke_repos, repo_names).await?;
-        let mononoke_repos = Arc::new(mononoke_repos);
-        let update_receiver = MononokeConfigUpdateReceiver::new(mononoke_repos.clone(), self);
-        self.configs
-            .register_for_update(Arc::new(update_receiver) as Arc<dyn ConfigUpdateReceiver>);
-        Ok(mononoke_repos)
-    }
-
-    /// Method responsible for constructing and adding a new repo to the
-    /// passed-in MononokeRepos instance.
-    pub async fn add_repo<Repo>(
-        &self,
-        repos: &Arc<MononokeRepos<Repo>>,
-        repo_name: &str,
-    ) -> Result<()>
+    /// Open an existing repo object
+    /// Make sure that the opened repo has redaction DISABLED
+    pub async fn open_repo_unredacted<Repo>(&self, repo_args: &impl AsRepoArg) -> Result<Repo>
     where
         Repo: for<'builder> AsyncBuildable<'builder, RepoFactoryBuilder<'builder>>,
     {
-        let repo_config = self.repo_config_by_name(repo_name)?;
-        let repo_id = repo_config.repoid.id();
-        let common_config = &self.repo_configs().common;
+        let repo_arg = repo_args.as_repo_arg();
+        let (repo_name, mut repo_config) = self.repo_config(repo_arg)?;
+        let common_config = self.repo_configs().common.clone();
+        repo_config.redaction = Redaction::Disabled;
         let repo = self
             .repo_factory
-            .build(repo_name.to_string(), repo_config, common_config.clone())
+            .build(repo_name, repo_config, common_config)
             .await?;
-        repos.add(repo_name, repo_id, repo);
-        Ok(())
+        Ok(repo)
     }
 
-    /// Method responsible for removing an existing repo based on the input
-    /// repo-name from the passed-in MononokeRepos instance.
-    pub fn remove_repo<Repo>(&self, repos: &Arc<MononokeRepos<Repo>>, repo_name: &str) {
-        repos.remove(repo_name);
-    }
-
-    /// Method responsible for reloading the current set of loaded repos within
-    /// MononokeApp. The reload will involve reconstruction of the repos using
-    /// the current version of the RepoConfig. The old repos will be dropped
-    /// once all references to it cease to exist.
-    pub async fn reload_repos<Repo>(&self, repos: &Arc<MononokeRepos<Repo>>) -> Result<()>
+    /// Create a new repo object -- for local instances, expect its contents to be empty.
+    /// Makes sure that the opened repo has redaction DISABLED
+    pub async fn create_repo_unredacted<Repo>(&self, repo_arg: &impl AsRepoArg) -> Result<Repo>
     where
         Repo: for<'builder> AsyncBuildable<'builder, RepoFactoryBuilder<'builder>>,
     {
-        let repo_names = repos.iter_names();
-        self.populate_repos(repos, repo_names).await?;
-        Ok(())
+        let (repo_name, mut repo_config) = self.repo_config(repo_arg.as_repo_arg())?;
+        let common_config = self.repo_configs().common.clone();
+
+        match &repo_config.storage_config.blobstore {
+            BlobConfig::Files { path } | BlobConfig::Sqlite { path } => {
+                setup_repo_dir(path, CreateStorage::ExistingOrCreate)?;
+            }
+            _ => {}
+        }
+        repo_config.redaction = Redaction::Disabled;
+        let repo = self
+            .repo_factory
+            .build(repo_name, repo_config, common_config)
+            .await?;
+        Ok(repo)
     }
 
     /// Open a source and target repos based on user-provided arguments.
@@ -566,6 +528,82 @@ impl MononokeApp {
 
         let (source_repo, target_repo) = try_join!(source_repo_fut, target_repo_fut)?;
         Ok((source_repo, target_repo))
+    }
+
+    /// Create a manager for all configured shallow-sharded repos, excluding
+    /// those filtered by `repo_filter_from` in `MononokeEnvironment`.
+    pub async fn open_managed_repos<Repo>(&self) -> Result<MononokeReposManager<Repo>>
+    where
+        Repo: for<'builder> AsyncBuildable<'builder, RepoFactoryBuilder<'builder>>
+            + Send
+            + Sync
+            + 'static,
+    {
+        let repo_filter = self.environment().filter_repos.clone();
+        let repo_names =
+            self.repo_configs()
+                .repos
+                .clone()
+                .into_iter()
+                .filter_map(|(name, config)| {
+                    let is_matching_filter =
+                        repo_filter.as_ref().map_or(true, |filter| filter(&name));
+                    // Initialize repos that are enabled and not deep-sharded (i.e. need to exist
+                    // at service startup)
+                    if config.enabled && !config.deep_sharded && is_matching_filter {
+                        Some(name)
+                    } else {
+                        None
+                    }
+                });
+        self.open_named_managed_repos(repo_names).await
+    }
+
+    /// Create a manager for a set of named managed repos.  These repos must
+    /// be configured in the config.
+    pub async fn open_named_managed_repos<Repo, Names>(
+        &self,
+        repo_names: Names,
+    ) -> Result<MononokeReposManager<Repo>>
+    where
+        Names: IntoIterator<Item = String>,
+        Repo: for<'builder> AsyncBuildable<'builder, RepoFactoryBuilder<'builder>>
+            + Send
+            + Sync
+            + 'static,
+    {
+        let logger = self.logger().clone();
+        let start = Instant::now();
+        let repos_mgr = MononokeReposManager::new(
+            self.configs.clone(),
+            self.repo_factory().clone(),
+            self.logger().clone(),
+            repo_names,
+        )
+        .await?;
+        info!(
+            &logger,
+            "All repos initialized. It took: {} seconds",
+            start.elapsed().as_secs()
+        );
+        STATS::completion_duration_secs
+            .add_value(start.elapsed().as_secs().try_into().unwrap_or(i64::MAX));
+        Ok(repos_mgr)
+    }
+
+    /// Create a manager for a single repo, specified by repo arguments.
+    pub async fn open_managed_repo_arg<Repo>(
+        &self,
+        repo_arg: &impl AsRepoArg,
+    ) -> Result<MononokeReposManager<Repo>>
+    where
+        Repo: for<'builder> AsyncBuildable<'builder, RepoFactoryBuilder<'builder>>
+            + Send
+            + Sync
+            + 'static,
+    {
+        let (repo_name, _) = self.repo_config(repo_arg.as_repo_arg())?;
+        self.open_named_managed_repos(Some(repo_name)).await
     }
 
     /// Open just the blobstore based on user-provided arguments.
@@ -710,4 +748,37 @@ impl MononokeApp {
 
         Ok(builder)
     }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum CreateStorage {
+    ExistingOnly,
+    ExistingOrCreate,
+}
+
+pub fn setup_repo_dir<P: AsRef<Path>>(data_dir: P, create: CreateStorage) -> Result<()> {
+    let data_dir = data_dir.as_ref();
+
+    if !data_dir.is_dir() {
+        bail!("{:?} does not exist or is not a directory", data_dir);
+    }
+
+    // Validate directory layout
+    #[allow(clippy::single_element_loop)]
+    for subdir in &["blobs"] {
+        let subdir = data_dir.join(subdir);
+
+        if subdir.exists() && !subdir.is_dir() {
+            bail!("{:?} already exists and is not a directory", subdir);
+        }
+
+        if !subdir.exists() {
+            if CreateStorage::ExistingOnly == create {
+                bail!("{:?} not found in ExistingOnly mode", subdir,);
+            }
+            fs::create_dir(&subdir)
+                .with_context(|| format!("failed to create subdirectory {:?}", subdir))?;
+        }
+    }
+    Ok(())
 }

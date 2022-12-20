@@ -111,8 +111,13 @@ def clone(ui, url, destpath=None, update=True, pullnames=None):
         destpath = os.path.realpath(basename)
 
     destpath = ui.expandpath(destpath)
+
     if os.path.lexists(destpath):
-        raise error.Abort(_("destination '%s' already exists") % destpath)
+        if os.path.isdir(destpath):
+            if os.listdir(destpath):
+                raise error.Abort(_("destination '%s' is not empty") % destpath)
+        else:
+            raise error.Abort(_("destination '%s' already exists") % destpath)
 
     try:
         repo = createrepo(ui, url, destpath)
@@ -128,6 +133,7 @@ def clone(ui, url, destpath=None, update=True, pullnames=None):
         repo = None
         shutil.rmtree(destpath, ignore_errors=True)
         raise
+
     if update is not False:
         if update is True:
             node = repo.changelog.tip()
@@ -235,7 +241,7 @@ def openstore(repo):
 def readconfig(repo):
     """Read git config into a config object"""
     out = callgit(repo, ["config", "-l"])
-    config = bindings.configparser.config()
+    config = bindings.configloader.config()
     for line in out.splitlines():
         line = line.decode("utf-8", "surrogateescape")
         if "=" not in line:
@@ -541,7 +547,7 @@ def parsesubmodules(ctx):
     data = ctx[".gitmodules"].data()
     # strip leading spaces
     data = b"".join(l.strip() + b"\n" for l in data.splitlines())
-    config = bindings.configparser.config()
+    config = bindings.configloader.config()
     config.parse(data.decode("utf-8", "surrogateescape"), ".gitmodules")
     prefix = 'submodule "'
     suffix = '"'

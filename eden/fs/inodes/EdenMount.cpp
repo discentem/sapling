@@ -389,6 +389,7 @@ FOLLY_NODISCARD folly::Future<folly::Unit> EdenMount::initialize(
       "EdenMount::initialize");
   return serverState_->getFaultInjector()
       .checkAsync("mount", getPath().view())
+      .semi()
       .via(getServerThreadPool().get())
       .thenValue([this, parent](auto&&) {
         return objectStore_->getRootTree(parent, context)
@@ -1442,6 +1443,7 @@ folly::Future<CheckoutResult> EdenMount::checkout(
   auto journalDiffCallback = std::make_shared<JournalDiffCallback>();
   return serverState_->getFaultInjector()
       .checkAsync("checkout", getPath().view())
+      .semi()
       .via(getServerThreadPool().get())
       .thenValue([this, ctx, parent1Hash = oldParent, snapshotHash](auto&&) {
         XLOG(DBG7) << "Checkout: getRoots";
@@ -1541,6 +1543,7 @@ folly::Future<CheckoutResult> EdenMount::checkout(
         auto rootInode = getRootInode();
         return serverState_->getFaultInjector()
             .checkAsync("inodeCheckout", getPath().view())
+            .semi()
             .via(getServerThreadPool().get())
             .thenValue([ctx,
                         treeResults = std::move(treeResults),
@@ -1662,11 +1665,13 @@ void EdenMount::forgetStaleInodes() {
 ImmediateFuture<folly::Unit> EdenMount::flushInvalidations() {
 #ifndef _WIN32
   XLOG(DBG4) << "waiting for inode invalidations to complete";
-  ImmediateFuture<folly::Unit> flushInvalidationsFuture;
+  auto flushInvalidationsFuture = ImmediateFuture<folly::Unit>::makeEmpty();
   if (auto* fuseChannel = getFuseChannel()) {
     flushInvalidationsFuture = fuseChannel->flushInvalidations().semi();
   } else if (auto* nfsdChannel = getNfsdChannel()) {
     flushInvalidationsFuture = nfsdChannel->flushInvalidations().semi();
+  } else {
+    flushInvalidationsFuture = folly::unit;
   }
   return std::move(flushInvalidationsFuture).thenValue([](auto&&) {
     XLOG(DBG4) << "finished processing inode invalidations";
@@ -2474,6 +2479,18 @@ std::optional<TreePrefetchLease> EdenMount::tryStartTreePrefetch(
     numPrefetchesInProgress_.fetch_sub(1, std::memory_order_acq_rel);
     return std::nullopt;
   }
+}
+
+std::optional<EdenMount::WorkingCopyGCLease> EdenMount::tryStartWorkingCopyGC(
+    TreeInodePtr inode) {
+  bool expectedInProgress = false;
+  if (!workingCopyGCInProgress_.compare_exchange_strong(
+          expectedInProgress, true, std::memory_order_acq_rel)) {
+    return std::nullopt;
+  }
+
+  return EdenMount::WorkingCopyGCLease{
+      &workingCopyGCInProgress_, std::move(inode)};
 }
 
 void EdenMount::treePrefetchFinished() noexcept {

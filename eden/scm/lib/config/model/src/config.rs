@@ -19,7 +19,7 @@ use crate::Result;
 
 /// Readable config. This can be used as a trait object.
 #[auto_impl::auto_impl(&, Box, Arc)]
-pub trait Config {
+pub trait Config: Send + Sync {
     /// Get config names in the given section. Sorted by insertion order.
     fn keys(&self, section: &str) -> Vec<Text>;
 
@@ -61,12 +61,16 @@ pub trait Config {
     }
 
     /// Break the config into (immutable) layers.
-    /// If returns None, then the config object is considered atomic.
-    /// If returns a list, then the list should contain all configs. The order
-    /// matters. Config with a larger index overrides configs with smaller
-    /// indexes.
-    fn layers(&self) -> Option<Vec<Arc<dyn Config>>> {
-        None
+    ///
+    /// If returns an empty list, then the config object is considered atomic.
+    ///
+    /// If returns a list, then those are considered "sub"-configs that this
+    /// config will consider. The order matters. Config with a larger index
+    /// overrides configs with smaller indexes. Note the combination of all
+    /// sub-configs might not be equivalent to the "self" config, since
+    /// there might be some overrides.
+    fn layers(&self) -> Vec<Arc<dyn Config>> {
+        Vec::new()
     }
 
     /// The name of the current layer.

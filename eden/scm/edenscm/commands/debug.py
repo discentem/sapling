@@ -699,6 +699,71 @@ def debugdetectissues(ui, repo) -> None:
             ui.log("repoissues", issue.message, category=issue.category, **issue.data)
 
 
+@command("debugduplicatedconfig", cmdutil.templateopts, "")
+def debugduplicatedconfig(ui, repo, **opts) -> None:
+    """find duplicated or overridden configs"""
+    if "*" not in ui.configlist("configs", "allowedlocations"):
+        ui.warn(
+            _(
+                "consider '--config=configs.allowedlocations=*' for a more complete analysis\n"
+            )
+        )
+    cfg = ui._rcfg
+    fm = ui.formatter("debugduplicatedconfig", opts)
+
+    def friendly_source(location, source):
+        # location can be None, or (file, ...). source is like 'user',
+        # 'system', etc.
+        if location:
+            return location[0]
+        else:
+            return source
+
+    def short_value(value):
+        # Truncate multi-line or long value.
+        if value and "\n" in value:
+            value = value.split("\n", 1)[0] + " ..."
+        if value and len(value) > 40:
+            value = value[:40] + "..."
+        return value
+
+    for section in cfg.sections():
+        for name in cfg.names(section):
+            # Skip user config.
+            sources = [s for s in cfg.sources(section, name) if s[-1] != "user"]
+            if len(sources) <= 1:
+                continue
+            # The last item in sources takes effect.
+            picked_value, picked_location, picked_source = sources[-1]
+            picked_source = friendly_source(*sources[-1][1:3])
+            fm.startitem()
+            fm.write(
+                "section name value source",
+                "%s.%s=%s defined by %s\n",
+                section,
+                name,
+                short_value(picked_value),
+                picked_source,
+            )
+            item_fm = fm.nested("problems")
+            for value, location, source in sources[:-1]:
+                source = friendly_source(location, source)
+                if value == picked_value:
+                    problem = "duplicated"
+                else:
+                    problem = "overridden"
+                item_fm.startitem()
+                item_fm.write(
+                    "problem source value",
+                    "  %s: %s (%s)\n",
+                    problem,
+                    source,
+                    short_value(value),
+                )
+            item_fm.end()
+    fm.end()
+
+
 def _debugdisplaycolor(ui) -> None:
     ui = ui.copy()
     ui._styles.clear()
@@ -1348,7 +1413,8 @@ def debugexportrevlog(ui, repo, path, **opts) -> None:
             self.append_raw(revlog_i_path, data)
             return node
 
-    lite_repo = LiteRevlogRepo(os.path.join(path, ui.identity.dotdir()))
+    # not using ui.identity.dotdir() for Mercurial compatibility
+    lite_repo = LiteRevlogRepo(os.path.join(path, ".hg"))
 
     from .. import exchange
 
@@ -3660,24 +3726,18 @@ def debugwireargs(ui, repopath, *vals, **opts) -> None:
     [
         ("p", "print", False, _("print name to hash mapping of created nodes")),
         ("b", "bookmarks", True, _("create bookmarks")),
+        ("f", "files", True, _("create files")),
         ("", "write-env", "", _("write NAME=HEX per line to a given file (ADVANCED)")),
     ],
 )
 def debugdrawdag(ui, repo, **opts) -> None:
     r"""read an ASCII graph from stdin and create changesets
 
-    The ASCII graph is like what :prog:`log -G` outputs, with each `o` replaced
-    to the name of the node. The command will create dummy changesets and local
-    tags with those names to make the dummy changesets easier to be referred
-    to.
+    Create commits to match the graph described using the drawdag language.
+    Check ``test-drawdag.t`` for examples.
 
-    If the name of a node is a single character 'o', It will be replaced by the
-    word to the right. This makes it easier to reuse
-    :prog:`log -G -T '{desc}'` outputs.
-
-    For root (no parents) nodes, revset can be used to query existing repo.
-    Note that the revset cannot have confusing characters which can be seen as
-    the part of the graph edges, like `|/+-\`.
+    This command can execute Python logic from input. Therefore, never feed
+    it with untrusted input!
     """
     text = decodeutf8(ui.fin.read())
     return drawdag.drawdag(repo, text, **opts)

@@ -980,6 +980,8 @@ Test list of internal help commands
                  dump indexedlog data
    debugdumptrace
                  export tracing information
+   debugduplicatedconfig
+                 find duplicated or overridden configs
    debugdynamicconfig
                  generate the dynamic configuration
    debugedenimporthelper
@@ -1664,7 +1666,7 @@ Test dynamic list of merge tools only shows up once
       the two file versions, so they can determine the changes made on both
       branches.
   
-      Merge tools are used both for 'hg resolve', 'hg merge', 'hg update', 'hg
+      Merge tools are used both for 'hg resolve', 'hg merge', 'hg goto', 'hg
       backout' and in several extensions.
   
       Usually, the merge tool tries to automatically reconcile the files by
@@ -1679,8 +1681,8 @@ Test dynamic list of merge tools only shows up once
       =====================
   
       External merge tools and their properties are configured in the merge-
-      tools configuration section - see hgrc(5) - but they can often just be
-      named by their executable.
+      tools configuration section - see 'hg help config.merge-tools' - but they
+      can often just be named by their executable.
   
       A merge tool is generally usable if its executable can be found on the
       system and if it can handle the merge. The executable is found if it is an
@@ -1792,7 +1794,7 @@ Test dynamic list of merge tools only shows up once
          first can be controlled by the premerge setting of the merge tool.
          Premerge is enabled by default unless the file is binary or a symlink.
   
-      See the merge-tools and ui sections of hgrc(5) for details on the
+      See the merge-tools and ui sections of 'hg help config' for details on the
       configuration of merge tools.
 
 Compression engines listed in `hg help bundlespec`

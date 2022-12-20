@@ -52,6 +52,13 @@ pub struct BssmDirectory {
 }
 
 impl BssmEntry {
+    pub fn into_dir(self) -> Option<BssmDirectory> {
+        match self {
+            Self::File => None,
+            Self::Directory(dir) => Some(dir),
+        }
+    }
+
     pub fn rollup_count(&self) -> u64 {
         match self {
             Self::File => 1,
@@ -189,6 +196,18 @@ impl BasenameSuffixSkeletonManifest {
     ) -> BoxStream<'a, Result<(MPathElement, BssmEntry)>> {
         self.subentries
             .into_entries(ctx, blobstore)
+            .map(|res| res.and_then(|(k, v)| anyhow::Ok((MPathElement::from_smallvec(k)?, v))))
+            .boxed()
+    }
+
+    pub fn into_prefix_subentries<'a>(
+        self,
+        ctx: &'a CoreContext,
+        blobstore: &'a impl Blobstore,
+        prefix: &'a [u8],
+    ) -> BoxStream<'a, Result<(MPathElement, BssmEntry)>> {
+        self.subentries
+            .into_prefix_entries(ctx, blobstore, prefix)
             .map(|res| res.and_then(|(k, v)| anyhow::Ok((MPathElement::from_smallvec(k)?, v))))
             .boxed()
     }

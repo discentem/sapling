@@ -18,7 +18,6 @@ use anyhow::Error;
 use async_trait::async_trait;
 use clap::Parser;
 use cloned::cloned;
-use cmdlib::helpers::serve_forever;
 use cmdlib_logging::ScribeLoggingArgs;
 use connection_security_checker::ConnectionSecurityChecker;
 use environment::WarmBookmarksCacheDerivedData;
@@ -30,13 +29,11 @@ use fbinit::FacebookInit;
 use megarepo_api::MegarepoApi;
 use mononoke_api::repo::Repo;
 use mononoke_api::CoreContext;
-use mononoke_api::Mononoke;
 use mononoke_app::args::HooksAppExtension;
 use mononoke_app::args::RepoFilterAppExtension;
 use mononoke_app::args::ShutdownTimeoutArgs;
-use mononoke_app::MononokeApp;
 use mononoke_app::MononokeAppBuilder;
-use mononoke_repos::MononokeRepos;
+use mononoke_app::MononokeReposManager;
 use panichandler::Fate;
 use permission_checker::DefaultAclProvider;
 use slog::info;
@@ -49,7 +46,6 @@ use srserver::service_framework::ServiceFramework;
 use srserver::service_framework::ThriftStatsModule;
 use srserver::ThriftServer;
 use srserver::ThriftServerBuilder;
-use tokio::sync::oneshot;
 use tokio::task;
 
 mod commit_id;
@@ -90,33 +86,31 @@ struct ScsServerArgs {
     sharded_executor_args: ShardedExecutorArgs,
 }
 
-/// Struct representing the Source Control Service process.
-pub struct SCSProcess {
-    app: Arc<MononokeApp>,
-    repos: Arc<MononokeRepos<Repo>>,
+/// Struct representing the Source Control Service process when sharding by
+/// repo.
+pub struct ScsServerProcess {
+    repos_mgr: Arc<MononokeReposManager<Repo>>,
 }
 
-impl SCSProcess {
-    fn new(app: Arc<MononokeApp>, repos: Arc<MononokeRepos<Repo>>) -> Self {
-        Self { app, repos }
+impl ScsServerProcess {
+    fn new(repos_mgr: MononokeReposManager<Repo>) -> Self {
+        let repos_mgr = Arc::new(repos_mgr);
+        Self { repos_mgr }
     }
 }
 
 #[async_trait]
-impl RepoShardedProcess for SCSProcess {
+impl RepoShardedProcess for ScsServerProcess {
     async fn setup(&self, repo_name: &str) -> anyhow::Result<Arc<dyn RepoShardedProcessExecutor>> {
-        let logger = self.app.repo_logger(repo_name);
+        let logger = self.repos_mgr.repo_logger(repo_name);
         info!(&logger, "Setting up repo {} in SCS service", repo_name);
         // Check if the input repo is already initialized. This can happen if the repo is a
         // shallow-sharded repo, in which case it would already be initialized during service startup.
-        if self.repos.get_by_name(repo_name).is_none() {
+        if self.repos_mgr.repos().get_by_name(repo_name).is_none() {
             // The input repo is a deep-sharded repo, so it needs to be added now.
-            self.app
-                .add_repo(&self.repos, repo_name)
-                .await
-                .with_context(|| {
-                    format!("Failure in setting up repo {} in SCS service", repo_name)
-                })?;
+            self.repos_mgr.add_repo(repo_name).await.with_context(|| {
+                format!("Failure in setting up repo {} in SCS service", repo_name)
+            })?;
             info!(&logger, "Completed repo {} setup in SCS service", repo_name);
         } else {
             info!(
@@ -124,27 +118,25 @@ impl RepoShardedProcess for SCSProcess {
                 "Repo {} is already setup in SCS service", repo_name
             );
         }
-        Ok(Arc::new(SCSProcessExecutor {
+        Ok(Arc::new(ScsServerProcessExecutor {
             repo_name: repo_name.to_string(),
-            repos: Arc::clone(&self.repos),
-            app: Arc::clone(&self.app),
+            repos_mgr: self.repos_mgr.clone(),
         }))
     }
 }
 
-/// Struct representing the execution of SCS service
-/// over the context of a provided repo.
-pub struct SCSProcessExecutor {
+/// Struct representing the execution of the source control service for a
+/// particular repo when sharding by repo.
+pub struct ScsServerProcessExecutor {
     repo_name: String,
-    app: Arc<MononokeApp>,
-    repos: Arc<MononokeRepos<Repo>>,
+    repos_mgr: Arc<MononokeReposManager<Repo>>,
 }
 
 #[async_trait]
-impl RepoShardedProcessExecutor for SCSProcessExecutor {
+impl RepoShardedProcessExecutor for ScsServerProcessExecutor {
     async fn execute(&self) -> anyhow::Result<()> {
         info!(
-            self.app.logger(),
+            self.repos_mgr.logger(),
             "Serving repo {} in SCS service", &self.repo_name,
         );
         Ok(())
@@ -152,8 +144,8 @@ impl RepoShardedProcessExecutor for SCSProcessExecutor {
 
     async fn stop(&self) -> anyhow::Result<()> {
         let config = self
-            .app
-            .repo_config_by_name(&self.repo_name)
+            .repos_mgr
+            .repo_config(&self.repo_name)
             .with_context(|| {
                 format!(
                     "Failure in stopping repo {}. The config for repo doesn't exist",
@@ -165,14 +157,14 @@ impl RepoShardedProcessExecutor for SCSProcessExecutor {
         // If repo is shallow-sharded, then keep it since regardless of SM sharding, shallow
         // sharded repos need to be present on each host.
         if config.deep_sharded {
-            self.repos.remove(&self.repo_name);
+            self.repos_mgr.remove_repo(&self.repo_name);
             info!(
-                self.app.logger(),
+                self.repos_mgr.logger(),
                 "No longer serving repo {} in SCS service.", &self.repo_name,
             );
         } else {
             info!(
-                self.app.logger(),
+                self.repos_mgr.logger(),
                 "Continuing serving repo {} in SCS service because it's shallow-sharded.",
                 &self.repo_name,
             );
@@ -185,17 +177,15 @@ impl RepoShardedProcessExecutor for SCSProcessExecutor {
 fn main(fb: FacebookInit) -> Result<(), Error> {
     panichandler::set_panichandler(Fate::Abort);
 
-    let app = Arc::new(
-        MononokeAppBuilder::new(fb)
-            .with_warm_bookmarks_cache(WarmBookmarksCacheDerivedData::AllKinds)
-            .with_app_extension(HooksAppExtension {})
-            .with_app_extension(RepoFilterAppExtension {})
-            .build::<ScsServerArgs>()?,
-    );
+    let app = MononokeAppBuilder::new(fb)
+        .with_warm_bookmarks_cache(WarmBookmarksCacheDerivedData::AllKinds)
+        .with_app_extension(HooksAppExtension {})
+        .with_app_extension(RepoFilterAppExtension {})
+        .build::<ScsServerArgs>()?;
 
     let args: ScsServerArgs = app.args()?;
 
-    let logger = app.logger();
+    let logger = app.logger().clone();
     let runtime = app.runtime();
 
     let exec = runtime.clone();
@@ -203,8 +193,9 @@ fn main(fb: FacebookInit) -> Result<(), Error> {
 
     let scuba_builder = env.scuba_sample_builder.clone();
 
-    let mononoke = Arc::new(runtime.block_on(Mononoke::new(Arc::clone(&app)))?);
-    let megarepo_api = Arc::new(runtime.block_on(MegarepoApi::new(app.clone(), mononoke.clone()))?);
+    let repos_mgr = runtime.block_on(app.open_managed_repos())?;
+    let mononoke = Arc::new(repos_mgr.make_mononoke_api()?);
+    let megarepo_api = Arc::new(runtime.block_on(MegarepoApi::new(&app, mononoke.clone()))?);
 
     let will_exit = Arc::new(AtomicBool::new(false));
 
@@ -240,7 +231,6 @@ fn main(fb: FacebookInit) -> Result<(), Error> {
             )
         }
     };
-    let mononoke_repos = mononoke.repos.clone();
     let monitoring_forever = {
         let monitoring_ctx = CoreContext::new_with_logger(fb, logger.clone());
         monitoring::monitoring_stats_submitter(monitoring_ctx, mononoke)
@@ -289,7 +279,7 @@ fn main(fb: FacebookInit) -> Result<(), Error> {
         fb,
         runtime.clone(),
         app.logger(),
-        || Arc::new(SCSProcess::new(app.clone(), mononoke_repos)),
+        || Arc::new(ScsServerProcess::new(repos_mgr)),
         false, // disable shard (repo) level healing
         SM_CLEANUP_TIMEOUT_SECS,
     )? {
@@ -304,20 +294,11 @@ fn main(fb: FacebookInit) -> Result<(), Error> {
         });
     }
 
-    // The service is running in the background on the folly executor, so
-    // there is no real service to serve, however we use `serve_forever` for
-    // its shutdown handling, which requires a dummy `server` future that will
-    // exit cleanly when shutdown is signalled.
-    let (exit_tx, exit_rx) = oneshot::channel();
-    let server = async move {
-        exit_rx.await?;
-        Ok(())
-    };
+    // Monitoring is provided by the `Fb303Module`, but we must still start
+    // stats aggregation.
+    app.start_stats_aggregation()?;
 
-    serve_forever(
-        runtime,
-        server,
-        logger,
+    app.wait_until_terminated(
         move || will_exit.store(true, Ordering::Relaxed),
         args.shutdown_timeout_args.shutdown_grace_period,
         async {
@@ -327,7 +308,6 @@ fn main(fb: FacebookInit) -> Result<(), Error> {
                 service_framework.stop();
             })
             .await;
-            let _ = exit_tx.send(());
         },
         args.shutdown_timeout_args.shutdown_timeout,
     )?;

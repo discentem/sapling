@@ -16,13 +16,10 @@ use anyhow::Error;
 use anyhow::Result;
 use clap::Parser;
 use cloned::cloned;
-use cmdlib::helpers::serve_forever;
 use cmdlib_logging::ScribeLoggingArgs;
 use fb303_core::server::make_BaseService_server;
 use fbinit::FacebookInit;
-use futures::future;
 use land_service_if::server::*;
-use mononoke_api::Mononoke;
 use mononoke_app::args::ShutdownTimeoutArgs;
 use mononoke_app::MononokeAppBuilder;
 use slog::info;
@@ -66,18 +63,22 @@ struct LandServiceServerArgs {
 
 #[fbinit::main]
 fn main(fb: FacebookInit) -> Result<(), Error> {
-    let app = Arc::new(MononokeAppBuilder::new(fb).build::<LandServiceServerArgs>()?);
+    let app = MononokeAppBuilder::new(fb).build::<LandServiceServerArgs>()?;
 
     // Process commandline flags
     let args: LandServiceServerArgs = app.args()?;
 
-    let logger = app.logger();
+    let logger = app.logger().clone();
     let runtime = app.runtime();
     let exec = runtime.clone();
     let env = app.environment();
 
     let scuba_builder = env.scuba_sample_builder.clone();
-    let mononoke = Arc::new(runtime.block_on(Mononoke::new(Arc::clone(&app)))?);
+    let mononoke = Arc::new(
+        runtime
+            .block_on(app.open_managed_repos())?
+            .make_mononoke_api()?,
+    );
 
     let will_exit = Arc::new(AtomicBool::new(false));
 
@@ -146,10 +147,11 @@ fn main(fb: FacebookInit) -> Result<(), Error> {
         writer.write_all(b"\n")?;
     }
 
-    serve_forever(
-        runtime,
-        future::pending(),
-        logger,
+    // Monitoring is provided by the `Fb303Module`, but we must still start
+    // stats aggregation.
+    app.start_stats_aggregation()?;
+
+    app.wait_until_terminated(
         move || will_exit.store(true, Ordering::Relaxed),
         args.shutdown_timeout_args.shutdown_grace_period,
         async {

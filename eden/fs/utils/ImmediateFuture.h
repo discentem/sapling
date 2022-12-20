@@ -25,9 +25,8 @@ namespace facebook::eden {
  * An attached callback may run either immediately or later, when the
  * ImmediateFuture's value is consumed.
  *
- * All methods can throw an DestroyedImmediateFutureError if an ImmediateFuture
- * is used after being destroyed. This can happen if an ImmediateFuture is used
- * after being moved.
+ * Like folly::Future and folly::SemiFuture, all methods can throw a
+ * folly::FutureInvalid exception if an ImmediateFuture is used after move.
  *
  * When detail::kImmediateFutureAlwaysDefer is set, all ImmediateFuture
  * constructor are pessimized to behave as if constructed from a non-ready
@@ -35,9 +34,22 @@ namespace facebook::eden {
  */
 template <typename T>
 class ImmediateFuture {
+  static_assert(
+      std::is_nothrow_move_constructible_v<T> &&
+          std::is_nothrow_move_assignable_v<T>,
+      "ImmediateFuture requires T be noexcept-move. "
+      "Box with std::unique_ptr if necessary.");
+
+  // Internal implementation requirements:
+
   // SemiFuture is a pointer-sized, move-only type, and we rely on it
   // being nothrow.
   static_assert(std::is_nothrow_move_constructible_v<folly::SemiFuture<T>>);
+
+  // If T is noexcept-move, Try<T> must also be noexcept-move.
+  static_assert(
+      std::is_nothrow_move_constructible_v<folly::Try<T>> &&
+      std::is_nothrow_move_assignable_v<folly::Try<T>>);
 
  public:
   /**
@@ -46,17 +58,23 @@ class ImmediateFuture {
   using value_type = T;
 
   /**
-   * Default construct an ImmediateFuture with T's default constructor.
+   * To match Future and SemiFuture, the default constructor is deleted.
+   * In-place construction should use the std::in_place constructor.
    */
-  ImmediateFuture() noexcept(std::is_nothrow_default_constructible_v<T>)
-      : ImmediateFuture{folly::Try<T>{T{}}} {}
+  ImmediateFuture() = delete;
+
+  /**
+   * Emplace an ImmediateFuture with the constructor arguments.
+   */
+  template <typename... Args>
+  explicit ImmediateFuture(std::in_place_t, Args&&... args) noexcept(
+      std::is_nothrow_constructible_v<T, Args&&...>);
 
   /**
    * Construct an ImmediateFuture with an already constructed value. No
    * folly::SemiFuture will be allocated.
    */
-  /* implicit */ ImmediateFuture(folly::Try<T>&& value) noexcept(
-      std::is_nothrow_move_constructible_v<folly::Try<T>>);
+  /* implicit */ ImmediateFuture(folly::Try<T>&& value) noexcept;
 
   /**
    * Construct an ImmediateFuture with an already constructed value. No
@@ -64,11 +82,11 @@ class ImmediateFuture {
    */
   template <
       typename U = T,
-      typename = std::enable_if_t<std::is_constructible_v<folly::Try<T>, U>>>
-  /* implicit */ ImmediateFuture(U value) noexcept(
-      std::is_nothrow_constructible_v<folly::Try<T>, U>&&
+      typename = std::enable_if_t<std::is_constructible_v<folly::Try<T>, U&&>>>
+  /* implicit */ ImmediateFuture(U&& value) noexcept(
+      std::is_nothrow_constructible_v<folly::Try<T>, U&&>&&
           std::is_nothrow_move_constructible_v<folly::Try<T>>)
-      : ImmediateFuture{folly::Try<T>{std::move(value)}} {}
+      : ImmediateFuture{folly::Try<T>{std::forward<U>(value)}} {}
 
   /**
    * Construct an ImmediateFuture with a SemiFuture.
@@ -84,15 +102,37 @@ class ImmediateFuture {
   /* implicit */ ImmediateFuture(folly::SemiFuture<T>&& fut) noexcept
       : ImmediateFuture{std::move(fut), SemiFutureReadiness::EagerSemiFuture} {}
 
+  /**
+   * Construct an ImmediateFuture with a Future.
+   *
+   * This constructor has the same semantics as ImmediateFuture{future.semi()}.
+   */
+  /* implicit */ ImmediateFuture(folly::Future<T>&& fut) noexcept
+      : ImmediateFuture{std::move(fut).semi()} {}
+
   ~ImmediateFuture();
 
-  ImmediateFuture(const ImmediateFuture<T>&) = delete;
-  ImmediateFuture<T>& operator=(const ImmediateFuture<T>&) = delete;
+  ImmediateFuture(const ImmediateFuture&) = delete;
+  ImmediateFuture& operator=(const ImmediateFuture&) = delete;
 
-  ImmediateFuture(ImmediateFuture<T>&&) noexcept(
-      std::is_nothrow_move_constructible_v<folly::Try<T>>);
-  ImmediateFuture<T>& operator=(ImmediateFuture<T>&&) noexcept(
-      std::is_nothrow_move_constructible_v<folly::Try<T>>);
+  ImmediateFuture(ImmediateFuture&&) noexcept;
+  ImmediateFuture& operator=(ImmediateFuture&&) noexcept;
+
+  /**
+   * Returns an ImmediateFuture in an empty state. Any attempt to then*() or
+   * get*() the returned ImmediateFuture will throw folly::FutureInvalid.
+   */
+  static ImmediateFuture makeEmpty() noexcept {
+    return ImmediateFuture{Empty{}};
+  }
+
+  /**
+   * Returns whether this future is valid. Returns false if moved-from or if
+   * returned by makeEmpty().
+   */
+  bool valid() const noexcept {
+    return kind_ != Kind::Nothing;
+  }
 
   /**
    * Call the func continuation once this future is ready.
@@ -231,7 +271,23 @@ class ImmediateFuture {
    */
   folly::Try<T> getTry(folly::HighResDuration timeout) &&;
 
+  /**
+   * Returns true if this ImmediateFuture contains an immediate result.
+   *
+   * This function is intended for tests -- use isReady() to know whether
+   * a value is available now.
+   */
+  bool debugIsImmediate() const noexcept {
+    return kind_ == Kind::Immediate;
+  }
+
  private:
+  using Try = folly::Try<T>;
+  using SemiFuture = folly::SemiFuture<T>;
+
+  struct Empty {};
+  explicit ImmediateFuture(Empty) noexcept;
+
   /**
    * Define the behavior of the SemiFuture constructor and continuation when
    * dealing with ready SemiFuture.
@@ -251,23 +307,16 @@ class ImmediateFuture {
     LazySemiFuture,
   };
 
-  ImmediateFuture(
-      folly::SemiFuture<T>&& fut,
-      SemiFutureReadiness readiness) noexcept;
+  ImmediateFuture(SemiFuture fut, SemiFutureReadiness readiness) noexcept;
 
   friend ImmediateFuture<folly::Unit> makeNotReadyImmediateFuture();
 
   /**
-   * Destroy this ImmediateFuture.
+   * Clear this ImmediateFuture's contents, marking it empty.
    *
-   * Any subsequent access to it will throw a DestroyedImmediateFutureError.
+   * Any subsequent access to it will throw folly::FutureInvalid.
    */
   void destroy();
-
-  union {
-    folly::Try<T> immediate_;
-    folly::SemiFuture<T> semi_;
-  };
 
   enum class Kind {
     /** Holds an immediate value, immediate_ is valid. */
@@ -285,15 +334,11 @@ class ImmediateFuture {
   // four by merging these tag bits with Try's tag bits, and differentiate
   // between Value, Exception, SemiFuture, and Nothing.
   Kind kind_;
-};
 
-/**
- * Exception thrown if the ImmediateFuture is used after being destroyed.
- */
-class DestroyedImmediateFutureError : public std::logic_error {
- public:
-  DestroyedImmediateFutureError()
-      : std::logic_error{"ImmediateFuture used after destruction"} {}
+  union {
+    Try immediate_;
+    SemiFuture semi_;
+  };
 };
 
 /**

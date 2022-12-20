@@ -37,7 +37,7 @@ Init can create a ".sl" repo.
 Clone can create a ".sl" repo.
 
   $ cd
-  $ HGIDENTITY=sl hg clone -q test:clone_me cloned
+  $ sl clone -q test:clone_me cloned
   $ find cloned
   cloned/foo
   $ ls cloned/.hg
@@ -56,8 +56,8 @@ Clone can create a ".sl" repo.
 
   $ cd cloned
 Status works in ".sl" repo
-  $ LOG=configparser::hg=info hg status -A
-   INFO configparser::hg: loading config repo_path=$TESTTMP/cloned
+  $ LOG=configloader::hg=info hg status -A
+   INFO configloader::hg: loading config repo_path=$TESTTMP/cloned
   C foo
   $ cd ..
 
@@ -77,7 +77,7 @@ Test repo config loading
   $ cd ..
   $ mkdir for_testing_dotsl_config
   $ cd for_testing_dotsl_config
-  $ HGIDENTITY=sl hg init
+  $ sl init
   $ cp ../for_testing_dothg_hgrc/.hg/config .sl/config
   $ hg config foo.bar --debug
   $TESTTMP/for_testing_dotsl_config/.sl/config:2: baz

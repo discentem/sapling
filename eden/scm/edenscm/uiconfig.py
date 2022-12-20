@@ -16,7 +16,7 @@ import random
 import time
 from typing import List, Optional, Tuple
 
-from bindings import configparser
+from bindings import configloader
 
 from . import configitems, error, pycompat, util
 from .encoding import unifromlocal, unitolocal
@@ -53,7 +53,7 @@ class uiconfig(object):
             self._pinnedconfigs = src._pinnedconfigs.copy()
             self._knownconfig = src._knownconfig
         else:
-            self._rcfg = rcfg or configparser.config()
+            self._rcfg = rcfg or configloader.config()
             # map from IDs to unserializable Python objects.
             self._unserializable = {}
             # config "pinned" that cannot be loaded from files.
@@ -69,29 +69,22 @@ class uiconfig(object):
         u = cls()
         try:
             # repopath should be the non-shared root directory
-            rcfg, issues = configparser.config.load(repopath or None)
+            rcfg = configloader.config.load(repopath or None)
         except Exception as ex:
             raise error.ParseError(str(ex))
 
         u._rcfg = rcfg
         ui._uiconfig = u
-        if repopath is not None:
-            reportissues(ui, issues)
 
         root = os.path.expanduser("~")
         u.fixconfig(root=repopath or root)
 
     def reload(self, ui, repopath):
         # The actual config expects the non-shared root directory.
-        issues = self._rcfg.reload(repopath, list(self._pinnedconfigs))
-        reportissues(ui, issues)
+        self._rcfg.reload(repopath, list(self._pinnedconfigs))
 
         # fixconfig expects the non-shard repo root, without the .hg.
         self.fixconfig(root=repopath)
-
-    def validatedynamic(self, ui):
-        issues = self._rcfg.validate()
-        reportissues(ui, issues)
 
     def copy(self):
         return self.__class__(self)
@@ -537,7 +530,7 @@ class uiconfig(object):
 
 def parselist(value):
     if isinstance(value, str):
-        return [unitolocal(v) for v in configparser.parselist(unifromlocal(value))]
+        return [unitolocal(v) for v in configloader.parselist(unifromlocal(value))]
     else:
         return value
 
@@ -564,27 +557,3 @@ def logages(ui, configpath, cachepath):
     ui.log("dynamicconfig_age", **kwargs)
 
     return mtime
-
-
-def reportissues(ui, issues):
-    for section, key, dynamic_value, file_value in issues:
-        msg = _("Config mismatch: %s.%s has '%s' (dynamic) vs '%s' (file)\n") % (
-            section,
-            key,
-            dynamic_value,
-            file_value,
-        )
-        if ui.configbool("configs", "mismatchwarn") and not ui.plain():
-            ui.warn(msg)
-
-        samplerate = ui.configint("configs", "mismatchsampling")
-        if random.randint(1, samplerate) == 1:
-            reponame = ui.config("remotefilelog", "reponame")
-            ui.log(
-                "config_mismatch",
-                msg,
-                config="%s.%s" % (section, key),
-                expected=file_value,
-                actual=dynamic_value,
-                repo=reponame or "unknown",
-            )

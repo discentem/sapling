@@ -64,16 +64,6 @@ else:
     import dbm
 
 
-try:
-    # pyre-fixme[21]: Could not find `gdbm`.
-    import gdbm
-
-    gdbm.open
-    hasgdbm = True
-except ImportError:
-    hasgdbm = False
-
-
 configtable = {}
 configitem = registrar.configitem(configtable)
 
@@ -100,7 +90,7 @@ def uisetup(ui):
 
 def extsetup(ui):
     # With experimental.copytrace=off there can be cryptic merge errors.
-    # Let"s change error message to suggest re-running the command with
+    # Let's change error message to suggest re-running the command with
     # enabled copytracing
     filemerge._localchangedotherdeletedmsg = _(
         "local%(l)s changed %(fd)s which other%(o)s deleted%(fa)s\n"
@@ -180,8 +170,6 @@ def opendbm(repo, flag):
     but gdbm is unfortunately not available everywhere, like on Windows.
     """
     dbms = [(dbm.open, "amendcopytrace", dbm.error)]
-    if hasgdbm:
-        dbms.append((gdbm.open, "amendcopytrace.gdbm", gdbm.error))
 
     for opener, fname, error in dbms:
         path = repo.localvfs.join(fname)

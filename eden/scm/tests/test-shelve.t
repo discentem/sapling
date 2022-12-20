@@ -534,6 +534,7 @@
   $ hg rebase -d 1 --config 'extensions.rebase='
   rebasing 323bfa07f744 "xyz"
   merging x
+  rebasing a2281b51947d "shelve changes to: xyz"
   $ hg unshelve
   unshelving change 'default'
   rebasing shelved changes
@@ -1286,7 +1287,7 @@
   2
   $ tglog
   @  6408d34d8180 'commit1'
-  $ hg update --clean --quiet .
+  $ hg goto --clean --quiet .
   $ hg shelve --list
   default * shelve changes to: commit1 (glob)
   $ hg unshelve

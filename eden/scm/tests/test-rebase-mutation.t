@@ -793,6 +793,7 @@ XXX: rev 3 should remain hidden. (debugstrip is rarely used so this might be oka
 
   $ hg rebase -d 'desc(B2)'
   note: not rebasing a8b11f55fb19 "B0", already in destination as 261e70097290 "B2"
+  rebasing 212cb178bcbb "C"
   rebasing 1a79b7535141 "D"
   $ hg up 'max(desc(C))'
   1 files updated, 0 files merged, 1 files removed, 0 files unresolved
@@ -917,7 +918,7 @@ Create a change in trunk
   $ hg commit -m "willconflict first version"
 
 Create the changes that we will rebase
-  $ hg update -C 'max(desc(bar))' -q
+  $ hg goto -C 'max(desc(bar))' -q
   $ printf "b" > willconflict
   $ hg add willconflict
   $ hg commit -m "willconflict second version"
@@ -1453,7 +1454,7 @@ parent gets moved:
   >  |/
   >  A
   > EOS
-  $ hg update "desc(D1)" -q --hidden
+  $ hg goto "desc(D1)" -q --hidden
   $ hg bookmark book -i
   $ hg rebase -r "desc(B)+desc(D1)" -d "desc(E)"
   rebasing 112478962961 "B"
@@ -1518,7 +1519,7 @@ rebasestate may contain hidden hashes. "rebase --abort" should work regardless.
   > EOS
 
   $ hg hide -q $B --config extensions.amend=
-  $ hg update -q $C --hidden
+  $ hg goto -q $C --hidden
   $ hg rebase -s $B -d $D
   rebasing 2ec65233581b "B"
   merging D

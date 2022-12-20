@@ -109,8 +109,6 @@ impl RepoContext {
         head: ChangesetId,
         base: ChangesetId,
         pushvars: Option<&HashMap<String, Bytes>>,
-        // TODO: Remove
-        push_source: CrossRepoPushSource,
         bookmark_restrictions: BookmarkKindRestrictions,
         push_authored_by: PushAuthoredBy,
     ) -> Result<PushrebaseOutcome, MononokeError> {
@@ -200,6 +198,7 @@ impl RepoContext {
                 pushvars,
                 CrossRepoPushSource::PushRedirected,
                 bookmark_restrictions,
+                true, // log_new_public_commits_to_scribe
             )
             .await?;
             // Convert response back, finishing the land on the small repo
@@ -216,8 +215,9 @@ impl RepoContext {
                 &bookmark,
                 changesets,
                 pushvars,
-                push_source,
+                CrossRepoPushSource::NativeToThisRepo,
                 bookmark_restrictions,
+                true, // log_new_public_commits_to_scribe
             )
             .await?
         };

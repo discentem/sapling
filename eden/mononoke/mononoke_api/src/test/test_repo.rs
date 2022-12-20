@@ -38,10 +38,11 @@ use mononoke_types::hash::Sha1;
 use mononoke_types::hash::Sha256;
 use mononoke_types::MPath;
 use slog::info;
-use synced_commit_mapping::SyncedCommitMapping;
+use synced_commit_mapping::ArcSyncedCommitMapping;
 use tests_utils::bookmark;
 use tests_utils::resolve_cs_id;
 use tests_utils::CreateCommitContext;
+use tunables::tunables;
 use tunables::with_tunables_async;
 use tunables::MononokeTunables;
 
@@ -446,7 +447,7 @@ async fn commit_find_files_impl(fb: FacebookInit) -> Result<(), Error> {
     assert_eq!(files, expected_files);
 
     // Basenames and Prefixes ordered
-    let files: Vec<_> = cs
+    let mut files: Vec<_> = cs
         .find_files(
             Some(vec![
                 MononokePath::try_from("dir1/subdir1/subsubdir2")?,
@@ -465,6 +466,7 @@ async fn commit_find_files_impl(fb: FacebookInit) -> Result<(), Error> {
         MononokePath::try_from("dir1/subdir1/subsubdir2/file_2")?,
         MononokePath::try_from("dir2/file_1_in_dir2")?,
     ];
+    files.sort();
     assert_eq!(files, expected_files);
 
     // Basenames and Prefixes ordered after
@@ -534,7 +536,7 @@ async fn commit_find_files_impl(fb: FacebookInit) -> Result<(), Error> {
             None,
             Some(vec![String::from("_1"), String::from("_2")]),
             ChangesetFileOrdering::Ordered {
-                after: Some(MononokePath::try_from("dir1/subdir1/subsubdir1a")?),
+                after: Some(MononokePath::try_from("dir1/subdir1/subsubdir1/file_1")?),
             },
         )
         .await?
@@ -601,7 +603,7 @@ async fn commit_find_files_impl(fb: FacebookInit) -> Result<(), Error> {
             None,
             Some(vec![String::from("1"), String::from("2")]),
             ChangesetFileOrdering::Ordered {
-                after: Some(MononokePath::try_from("dir1/subdir1/subsubdir1a")?),
+                after: Some(MononokePath::try_from("dir1/subdir1/subsubdir1/file_1")?),
             },
         )
         .await?
@@ -649,15 +651,28 @@ async fn commit_find_files_impl(fb: FacebookInit) -> Result<(), Error> {
         .await?
         .try_collect()
         .await?;
-    let expected_files = vec![
-        MononokePath::try_from("1")?,
-        MononokePath::try_from("dir1/file_1_in_dir1")?,
-        MononokePath::try_from("dir1/file_2_in_dir1")?,
-        MononokePath::try_from("dir1/subdir1/file_1")?,
-        MononokePath::try_from("dir1/subdir1/subsubdir1/file_1")?,
-        MononokePath::try_from("dir1/subdir1/subsubdir2/file_1")?,
-        MononokePath::try_from("dir2/file_1_in_dir2")?,
-    ];
+    // BSSM have different but consistent orders
+    let expected_files = if tunables().get_disable_basename_suffix_skeleton_manifest() {
+        vec![
+            MononokePath::try_from("1")?,
+            MononokePath::try_from("dir1/file_1_in_dir1")?,
+            MononokePath::try_from("dir1/file_2_in_dir1")?,
+            MononokePath::try_from("dir1/subdir1/file_1")?,
+            MononokePath::try_from("dir1/subdir1/subsubdir1/file_1")?,
+            MononokePath::try_from("dir1/subdir1/subsubdir2/file_1")?,
+            MononokePath::try_from("dir2/file_1_in_dir2")?,
+        ]
+    } else {
+        vec![
+            MononokePath::try_from("1")?,
+            MononokePath::try_from("dir1/subdir1/file_1")?,
+            MononokePath::try_from("dir1/subdir1/subsubdir1/file_1")?,
+            MononokePath::try_from("dir1/subdir1/subsubdir2/file_1")?,
+            MononokePath::try_from("dir1/file_1_in_dir1")?,
+            MononokePath::try_from("dir1/file_2_in_dir1")?,
+            MononokePath::try_from("dir2/file_1_in_dir2")?,
+        ]
+    };
     assert_eq!(files, expected_files);
 
     // Suffixes, basenames, ordered after
@@ -667,16 +682,25 @@ async fn commit_find_files_impl(fb: FacebookInit) -> Result<(), Error> {
             Some(vec![String::from("file_1_in_dir2")]),
             Some(vec![String::from("1")]),
             ChangesetFileOrdering::Ordered {
-                after: Some(MononokePath::try_from("dir1/subdir1/subsubdir1a")?),
+                after: Some(MononokePath::try_from("dir1/subdir1/subsubdir1/file_1")?),
             },
         )
         .await?
         .try_collect()
         .await?;
-    let expected_files = vec![
-        MononokePath::try_from("dir1/subdir1/subsubdir2/file_1")?,
-        MononokePath::try_from("dir2/file_1_in_dir2")?,
-    ];
+    let expected_files = if tunables().get_disable_basename_suffix_skeleton_manifest() {
+        vec![
+            MononokePath::try_from("dir1/subdir1/subsubdir2/file_1")?,
+            MononokePath::try_from("dir2/file_1_in_dir2")?,
+        ]
+    } else {
+        vec![
+            MononokePath::try_from("dir1/subdir1/subsubdir2/file_1")?,
+            MononokePath::try_from("dir1/file_1_in_dir1")?,
+            MononokePath::try_from("dir1/file_2_in_dir1")?,
+            MononokePath::try_from("dir2/file_1_in_dir2")?,
+        ]
+    };
     assert_eq!(files, expected_files);
 
     // Suffixes, basenames, prefixes
@@ -732,7 +756,7 @@ async fn commit_find_files_impl(fb: FacebookInit) -> Result<(), Error> {
             Some(vec![String::from("file_1_in_dir2")]),
             Some(vec![String::from("1")]),
             ChangesetFileOrdering::Ordered {
-                after: Some(MononokePath::try_from("dir1/subdir1/subsubdir3")?),
+                after: Some(MononokePath::try_from("dir1/subdir1/subsubdir2/file_1")?),
             },
         )
         .await?
@@ -750,10 +774,10 @@ async fn commit_find_files(fb: FacebookInit) {
 }
 
 #[fbinit::test]
-async fn commit_find_files_with_bssm(fb: FacebookInit) {
+async fn commit_find_files_without_bssm(fb: FacebookInit) {
     let tunables = MononokeTunables::default();
     tunables.update_bools(&hashmap! {
-        "enable_basename_suffix_skeleton_manifest".to_string() => true
+        "disable_basename_suffix_skeleton_manifest".to_string() => true
     });
     with_tunables_async(tunables, commit_find_files_impl(fb).boxed())
         .await
@@ -1320,7 +1344,7 @@ async fn init_x_repo(
     let (syncers, commit_sync_config, lv_cfg, lv_cfg_src) = init_small_large_repo(ctx).await?;
 
     let small_to_large = syncers.small_to_large;
-    let mapping: Arc<dyn SyncedCommitMapping> = Arc::new(small_to_large.get_mapping().clone());
+    let mapping: ArcSyncedCommitMapping = Arc::new(small_to_large.get_mapping().clone());
     let mononoke = Mononoke::new_test_xrepo(
         ctx.clone(),
         (

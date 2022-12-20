@@ -29,9 +29,7 @@ use futures::channel::oneshot;
 use futures::stream;
 use futures::stream::StreamExt;
 use futures::stream::TryStreamExt;
-use futures_watchdog::WatchdogExt;
 use mononoke_api::CoreContext;
-use mononoke_api::Mononoke;
 use mononoke_api::Repo;
 use mononoke_app::args::HooksAppExtension;
 use mononoke_app::args::McrouterAppExtension;
@@ -42,7 +40,7 @@ use mononoke_app::fb303::Fb303AppExtension;
 use mononoke_app::fb303::ReadyFlagService;
 use mononoke_app::MononokeApp;
 use mononoke_app::MononokeAppBuilder;
-use mononoke_repos::MononokeRepos;
+use mononoke_app::MononokeReposManager;
 use openssl::ssl::AlpnError;
 use slog::error;
 use slog::info;
@@ -94,29 +92,30 @@ struct MononokeServerArgs {
     land_service_client_private_key: Option<String>,
 }
 
-/// Struct representing the Mononoke API process.
-pub struct MononokeApiProcess {
-    app: Arc<MononokeApp>,
-    repos: Arc<MononokeRepos<Repo>>,
+/// Struct representing the Mononoke server process when sharding by repo.
+pub struct MononokeServerProcess {
+    fb: FacebookInit,
+    repos_mgr: Arc<MononokeReposManager<Repo>>,
 }
 
-impl MononokeApiProcess {
-    fn new(app: Arc<MononokeApp>, repos: Arc<MononokeRepos<Repo>>) -> Self {
-        Self { app, repos }
+impl MononokeServerProcess {
+    fn new(fb: FacebookInit, repos_mgr: MononokeReposManager<Repo>) -> Self {
+        let repos_mgr = Arc::new(repos_mgr);
+        Self { fb, repos_mgr }
     }
 
     async fn add_repo(&self, repo_name: &str, logger: &Logger) -> Result<()> {
         // Check if the input repo is already initialized. This can happen if the repo is a
         // shallow-sharded repo, in which case it would already be initialized during service startup.
-        if self.repos.get_by_name(repo_name).is_none() {
+        if self.repos_mgr.repos().get_by_name(repo_name).is_none() {
             // The input repo is a deep-sharded repo, so it needs to be added now.
-            self.app.add_repo(&self.repos, repo_name).await?;
-            match self.repos.get_by_name(repo_name) {
+            self.repos_mgr.add_repo(repo_name).await?;
+            match self.repos_mgr.repos().get_by_name(repo_name) {
                 None => bail!("Added repo {} does not exist in MononokeRepos", repo_name),
                 Some(repo) => {
                     let blob_repo = repo.blob_repo().clone();
                     let cache_warmup_params = repo.config().cache_warmup.clone();
-                    let ctx = CoreContext::new_with_logger(self.app.fb, logger.clone());
+                    let ctx = CoreContext::new_with_logger(self.fb, logger.clone());
                     cache_warmup(&ctx, &blob_repo, cache_warmup_params)
                         .await
                         .with_context(|| {
@@ -139,9 +138,9 @@ impl MononokeApiProcess {
 }
 
 #[async_trait]
-impl RepoShardedProcess for MononokeApiProcess {
+impl RepoShardedProcess for MononokeServerProcess {
     async fn setup(&self, repo_name: &str) -> anyhow::Result<Arc<dyn RepoShardedProcessExecutor>> {
-        let logger = self.app.repo_logger(repo_name);
+        let logger = self.repos_mgr.repo_logger(repo_name);
         info!(&logger, "Setting up repo {} in Mononoke service", repo_name);
         self.add_repo(repo_name, &logger).await.with_context(|| {
             format!(
@@ -149,25 +148,23 @@ impl RepoShardedProcess for MononokeApiProcess {
                 repo_name
             )
         })?;
-        Ok(Arc::new(MononokeApiProcessExecutor {
+        Ok(Arc::new(MononokeServerProcessExecutor {
             repo_name: repo_name.to_string(),
-            repos: Arc::clone(&self.repos),
-            app: Arc::clone(&self.app),
+            repos_mgr: self.repos_mgr.clone(),
         }))
     }
 }
 
-/// Struct representing the execution of Mononoke service
-/// over the context of a provided repo.
-pub struct MononokeApiProcessExecutor {
+/// Struct representing the execution of the Mononoke server for a particular
+/// repo when sharding by repo.
+pub struct MononokeServerProcessExecutor {
     repo_name: String,
-    app: Arc<MononokeApp>,
-    repos: Arc<MononokeRepos<Repo>>,
+    repos_mgr: Arc<MononokeReposManager<Repo>>,
 }
 
-impl MononokeApiProcessExecutor {
+impl MononokeServerProcessExecutor {
     fn remove_repo(&self, repo_name: &str) -> Result<()> {
-        let config = self.app.repo_config_by_name(repo_name).with_context(|| {
+        let config = self.repos_mgr.repo_config(repo_name).with_context(|| {
             format!(
                 "Failure in remove repo {}. The config for repo doesn't exist",
                 repo_name
@@ -178,14 +175,14 @@ impl MononokeApiProcessExecutor {
         // If repo is shallow-sharded, then keep it since regardless of SM sharding, shallow
         // sharded repos need to be present on each host.
         if config.deep_sharded {
-            self.repos.remove(repo_name);
+            self.repos_mgr.remove_repo(repo_name);
             info!(
-                self.app.logger(),
+                self.repos_mgr.logger(),
                 "No longer serving repo {} in Mononoke service.", repo_name,
             );
         } else {
             info!(
-                self.app.logger(),
+                self.repos_mgr.logger(),
                 "Continuing serving repo {} in Mononoke service because it's shallow-sharded.",
                 repo_name,
             );
@@ -195,10 +192,10 @@ impl MononokeApiProcessExecutor {
 }
 
 #[async_trait]
-impl RepoShardedProcessExecutor for MononokeApiProcessExecutor {
+impl RepoShardedProcessExecutor for MononokeServerProcessExecutor {
     async fn execute(&self) -> anyhow::Result<()> {
         info!(
-            self.app.logger(),
+            self.repos_mgr.logger(),
             "Serving repo {} in Mononoke service", &self.repo_name,
         );
         Ok(())
@@ -212,20 +209,18 @@ impl RepoShardedProcessExecutor for MononokeApiProcessExecutor {
 
 #[fbinit::main]
 fn main(fb: FacebookInit) -> Result<()> {
-    let app = Arc::new(
-        MononokeAppBuilder::new(fb)
-            .with_default_scuba_dataset("mononoke_test_perf")
-            .with_warm_bookmarks_cache(WarmBookmarksCacheDerivedData::HgOnly)
-            .with_app_extension(McrouterAppExtension {})
-            .with_app_extension(Fb303AppExtension {})
-            .with_app_extension(HooksAppExtension {})
-            .with_app_extension(RepoFilterAppExtension {})
-            .build::<MononokeServerArgs>()?,
-    );
+    let app = MononokeAppBuilder::new(fb)
+        .with_default_scuba_dataset("mononoke_test_perf")
+        .with_warm_bookmarks_cache(WarmBookmarksCacheDerivedData::HgOnly)
+        .with_app_extension(McrouterAppExtension {})
+        .with_app_extension(Fb303AppExtension {})
+        .with_app_extension(HooksAppExtension {})
+        .with_app_extension(RepoFilterAppExtension {})
+        .build::<MononokeServerArgs>()?;
     let args: MononokeServerArgs = app.args()?;
 
-    let root_log = app.logger();
-    let runtime = app.runtime();
+    let root_log = app.logger().clone();
+    let runtime = app.runtime().clone();
 
     let cslb_config = args.cslb_config.clone();
     info!(root_log, "Starting up");
@@ -266,26 +261,26 @@ fn main(fb: FacebookInit) -> Result<()> {
 
     info!(root_log, "Creating repo listeners");
 
-    let service = ReadyFlagService::new();
-    let (terminate_sender, terminate_receiver) = oneshot::channel::<()>();
-
     let scribe = args.scribe_logging_args.get_scribe(fb)?;
     let host_port = args.listening_host_port;
-
     let bound_addr_file = args.bound_address_file;
 
-    let env = app.environment();
-
-    let scuba = env.scuba_sample_builder.clone();
-
+    let service = ReadyFlagService::new();
+    let (terminate_sender, terminate_receiver) = oneshot::channel::<()>();
     let will_exit = Arc::new(AtomicBool::new(false));
 
+    let env = app.environment();
+    let scuba = env.scuba_sample_builder.clone();
+
+    app.start_monitoring("mononoke_server", service.clone())?;
+    app.start_stats_aggregation()?;
+
     let repo_listeners = {
-        cloned!(root_log, service, will_exit, env, runtime);
-        let app = Arc::clone(&app);
-        async move {
+        cloned!(root_log, will_exit, env, runtime);
+        move |app: MononokeApp| async move {
             let common = configs.common.clone();
-            let mononoke = Arc::new(Mononoke::new(Arc::clone(&app)).watched(&root_log).await?);
+            let repos_mgr = app.open_managed_repos().await?;
+            let mononoke = Arc::new(repos_mgr.make_mononoke_api()?);
             info!(&root_log, "Built Mononoke");
 
             info!(&root_log, "Warming up cache");
@@ -315,7 +310,7 @@ fn main(fb: FacebookInit) -> Result<()> {
                 app.fb,
                 runtime.clone(),
                 app.logger(),
-                || Arc::new(MononokeApiProcess::new(app.clone(), mononoke.repos.clone())),
+                || Arc::new(MononokeServerProcess::new(app.fb, repos_mgr)),
                 false, // disable shard (repo) level healing
                 SM_CLEANUP_TIMEOUT_SECS,
             )? {
@@ -351,22 +346,15 @@ fn main(fb: FacebookInit) -> Result<()> {
         }
     };
 
-    // Thread with a thrift service is now detached
-    let fb303_args = app.extension_args::<Fb303AppExtension>()?;
-    fb303_args.start_fb303_server(fb, "mononoke_server", root_log, service)?;
-
-    cmdlib::helpers::serve_forever(
-        runtime,
+    app.run_until_terminated(
         repo_listeners,
-        root_log,
         move || will_exit.store(true, Ordering::Relaxed),
         args.shutdown_timeout_args.shutdown_grace_period,
         async {
-            match terminate_sender.send(()) {
-                Err(err) => error!(root_log, "could not send termination signal: {:?}", err),
-                _ => {}
+            if let Err(err) = terminate_sender.send(()) {
+                error!(root_log, "could not send termination signal: {:?}", err);
             }
-            repo_listener::wait_for_connections_closed(root_log).await;
+            repo_listener::wait_for_connections_closed(&root_log).await;
         },
         args.shutdown_timeout_args.shutdown_timeout,
     )

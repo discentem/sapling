@@ -21,6 +21,12 @@ pub struct UnionConfig {
     name: Text,
 }
 
+impl Default for UnionConfig {
+    fn default() -> Self {
+        Self::from_configs(Vec::new())
+    }
+}
+
 impl UnionConfig {
     /// Construct `UnionConfig` from a list of configs.
     /// In case of conflicts, the last one wins.
@@ -37,6 +43,11 @@ impl UnionConfig {
             configs: self.configs,
             name,
         }
+    }
+
+    /// Push a config as a layer. It overrides other configs.
+    pub fn push(&mut self, config: Arc<dyn Config>) {
+        self.configs.push(config)
     }
 }
 
@@ -97,8 +108,8 @@ impl Config for UnionConfig {
         result.into()
     }
 
-    fn layers(&self) -> Option<Vec<Arc<dyn Config>>> {
-        Some(self.configs.clone())
+    fn layers(&self) -> Vec<Arc<dyn Config>> {
+        self.configs.clone()
     }
 
     fn layer_name(&self) -> Text {
@@ -194,7 +205,6 @@ v=23
         assert_eq!(
             config
                 .layers()
-                .unwrap()
                 .into_iter()
                 .map(|c| c.layer_name())
                 .collect::<Vec<_>>(),
@@ -203,5 +213,17 @@ v=23
 
         // layer_name()
         assert_eq!(config.layer_name(), "unioned");
+    }
+
+    #[test]
+    fn test_push() {
+        let config1 = static_config! {"b": { "v": "1" }};
+        let config2 = static_config! {"b": { "v": "2" }};
+
+        let mut config = UnionConfig::default();
+        config.push(Arc::new(config1));
+        assert_eq!(config.get("b", "v").unwrap(), "1");
+        config.push(Arc::new(config2));
+        assert_eq!(config.get("b", "v").unwrap(), "2");
     }
 }

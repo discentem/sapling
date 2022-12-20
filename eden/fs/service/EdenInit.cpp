@@ -56,7 +56,7 @@ void findEdenDir(EdenConfig& config) {
     // makes sure that any future updates to the config file do not affect the
     // value we use.  Once we start we want to always use a fixed location for
     // the eden directory.
-    config.edenDir.setValue(resolvedDir, ConfigSource::CommandLine);
+    config.edenDir.setValue(resolvedDir, ConfigSourceType::CommandLine);
   } catch (const std::exception& ex) {
     throw ArgumentError(fmt::format(
         FMT_STRING("error creating {}: {}"),
@@ -128,8 +128,7 @@ std::unique_ptr<EdenConfig> getEdenConfig(UserInfo& identity) {
   // Create the default EdenConfig. Next, update with command line arguments.
   // Command line arguments will take precedence over config file settings.
   auto edenConfig = std::make_unique<EdenConfig>(
-      identity.getUsername(),
-      identity.getUid(),
+      getUserConfigVariables(identity),
       identity.getHomeDirectory(),
       userConfigPath,
       systemConfigDir,

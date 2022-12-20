@@ -16,18 +16,16 @@ use std::sync::Arc;
 
 use anyhow::Error;
 use clap::Parser;
-use cmdlib::helpers::serve_forever;
-use cmdlib::monitoring::AliveService;
 use cmdlib_logging::ScribeLoggingArgs;
 use context::SessionContainer;
 use environment::WarmBookmarksCacheDerivedData;
 use fbinit::FacebookInit;
 use hostname::get_hostname;
 use megarepo_api::MegarepoApi;
-use mononoke_api::Mononoke;
 use mononoke_app::args::HooksAppExtension;
 use mononoke_app::args::RepoFilterAppExtension;
 use mononoke_app::args::ShutdownTimeoutArgs;
+use mononoke_app::fb303::AliveService;
 use mononoke_app::fb303::Fb303AppExtension;
 use mononoke_app::MononokeAppBuilder;
 
@@ -50,14 +48,12 @@ struct AsyncRequestsWorkerArgs {
 
 #[fbinit::main]
 fn main(fb: FacebookInit) -> Result<(), Error> {
-    let app = Arc::new(
-        MononokeAppBuilder::new(fb)
-            .with_warm_bookmarks_cache(WarmBookmarksCacheDerivedData::None)
-            .with_app_extension(HooksAppExtension {})
-            .with_app_extension(Fb303AppExtension {})
-            .with_app_extension(RepoFilterAppExtension {})
-            .build::<AsyncRequestsWorkerArgs>()?,
-    );
+    let app = MononokeAppBuilder::new(fb)
+        .with_warm_bookmarks_cache(WarmBookmarksCacheDerivedData::None)
+        .with_app_extension(HooksAppExtension {})
+        .with_app_extension(Fb303AppExtension {})
+        .with_app_extension(RepoFilterAppExtension {})
+        .build::<AsyncRequestsWorkerArgs>()?;
     let args: AsyncRequestsWorkerArgs = app.args()?;
     let request_limit = args.request_limit;
     let jobs_limit = args.jobs;
@@ -66,8 +62,12 @@ fn main(fb: FacebookInit) -> Result<(), Error> {
     let session = SessionContainer::new_with_defaults(env.fb);
     let ctx = session.new_context(logger.clone(), env.scuba_sample_builder.clone());
 
-    let mononoke = Arc::new(runtime.block_on(Mononoke::new(Arc::clone(&app)))?);
-    let megarepo = Arc::new(runtime.block_on(MegarepoApi::new(app.clone(), mononoke))?);
+    let mononoke = Arc::new(
+        runtime
+            .block_on(app.open_managed_repos())?
+            .make_mononoke_api()?,
+    );
+    let megarepo = Arc::new(runtime.block_on(MegarepoApi::new(&app, mononoke))?);
 
     let tw_job_cluster = std::env::var("TW_JOB_CLUSTER");
     let tw_job_name = std::env::var("TW_JOB_NAME");
@@ -86,21 +86,20 @@ fn main(fb: FacebookInit) -> Result<(), Error> {
     let will_exit = Arc::new(AtomicBool::new(false));
     let worker = worker::AsyncMethodRequestWorker::new(megarepo, name);
 
-    // Thread with a thrift service is now detached
-    let fb303_args = app.extension_args::<Fb303AppExtension>()?;
-    fb303_args.start_fb303_server(fb, SERVICE_NAME, logger, AliveService)?;
+    app.start_monitoring(SERVICE_NAME, AliveService)?;
+    app.start_stats_aggregation()?;
 
-    serve_forever(
-        runtime,
-        {
-            let will_exit = will_exit.clone();
-            async move || {
-                Ok(worker
-                    .run(&ctx, will_exit.clone(), request_limit, jobs_limit)
-                    .await?)
-            }
-        }(),
-        logger,
+    let run_worker = {
+        let will_exit = will_exit.clone();
+        move |_app| async move {
+            Ok(worker
+                .run(&ctx, will_exit, request_limit, jobs_limit)
+                .await?)
+        }
+    };
+
+    app.run_until_terminated(
+        run_worker,
         move || will_exit.store(true, Ordering::Relaxed),
         args.shutdown_timeout_args.shutdown_grace_period,
         async {

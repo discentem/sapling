@@ -45,6 +45,7 @@ from . import (
     extensions,
     filelog,
     git,
+    gpg,
     hook,
     identity,
     lock as lockmod,
@@ -551,7 +552,6 @@ class localrepository(object):
         if "hgsql" in self.requirements:
             # hgsql wants raw access to revlog. Disable modern features
             # unconditionally for hgsql.
-            self.ui.setconfig("experimental", "evolution", "obsolete", "hgsql")
             self.ui.setconfig("experimental", "narrow-heads", "false", "hgsql")
             self.ui.setconfig("experimental", "rust-commits", "false", "hgsql")
             self.ui.setconfig("visibility", "enabled", "false", "hgsql")
@@ -2807,6 +2807,7 @@ class localrepository(object):
                 user,
                 ctx.date(),
                 extra,
+                gpg.get_gpg_keyid(self.ui),
             )
             xp1, xp2 = p1.hex(), p2 and p2.hex() or ""
             self.hook("pretxncommit", throw=True, node=hex(n), parent1=xp1, parent2=xp2)

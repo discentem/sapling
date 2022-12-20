@@ -67,9 +67,9 @@ class DiffTest : public ::testing::Test {
     std::shared_ptr<EdenConfig> rawEdenConfig{
         EdenConfig::createTestEdenConfig()};
     rawEdenConfig->inMemoryTreeCacheSize.setValue(
-        kTreeCacheMaximumSize, ConfigSource::Default, true);
+        kTreeCacheMaximumSize, ConfigSourceType::Default, true);
     rawEdenConfig->inMemoryTreeCacheMinElements.setValue(
-        kTreeCacheMinimumEntries, ConfigSource::Default, true);
+        kTreeCacheMinimumEntries, ConfigSourceType::Default, true);
     auto edenConfig = std::make_shared<ReloadableConfig>(
         rawEdenConfig, ConfigReloadBehavior::NoReload);
     auto treeCache = TreeCache::create(edenConfig);
@@ -444,11 +444,6 @@ TEST_F(DiffTest, blockedFutures) {
   // Even though we mark it as ready, we still need the files themselves to be
   // ready since we compare blobs in the diff operation
   builder.setReady("a/b/c/d/e");
-  EXPECT_FALSE(resultFuture.isReady());
-
-  // Set all files as ready as well.
-  builder.setAllReady();
-  builder2.setAllReady();
   EXPECT_TRUE(resultFuture.isReady());
 
   auto result = std::move(resultFuture).get();
@@ -510,14 +505,6 @@ TEST_F(DiffTest, loadTreeError) {
 
   builder.setAllReadyUnderTree("a");
   builder2.setAllReadyUnderTree("a");
-  // Even though we set everything under a as ready, and the other directories,
-  // we still need the all files themselves to be ready since we compare blobs
-  // in the diff operation
-  EXPECT_FALSE(resultFuture.isReady());
-
-  // Set the rest of files as ready as well.
-  builder.setAllReady();
-  builder2.setAllReady();
   EXPECT_TRUE(resultFuture.isReady());
 
   auto result = std::move(resultFuture).get();

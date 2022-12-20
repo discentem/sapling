@@ -2,17 +2,20 @@
 
 #testcases pythonstatus ruststatus rustcommand scmstore
 #if pythonstatus
-  $ setconfig workingcopy.ruststatus=false 
+  $ setconfig workingcopy.ruststatus=false
+#else
+  $ setconfig workingcopy.ruststatus=true
 #endif
 #if rustcommand
   $ setconfig status.use-rust=True workingcopy.use-rust=True
+#else
+  $ setconfig status.use-rust=False workingcopy.use-rust=False
 #endif
 #if scmstore
   $ setconfig scmstore.auxindexedlog=true
   $ setconfig scmstore.status=true
 #endif
 
-  $ export HG_NO_DEFAULT_CONFIG=true
   $ configure modernclient
   $ newclientrepo repo1
   $ mkdir a b a/1 b/1 b/2
@@ -476,7 +479,7 @@ only known on target revision.
   $ hg add 1/2/3/4/5/b.txt
   $ hg commit -m '#1'
 
-  $ hg update -C 10edc5093fbb6ac8a9eea22a09d22f54188ab09b > /dev/null
+  $ hg goto -C 10edc5093fbb6ac8a9eea22a09d22f54188ab09b > /dev/null
   $ hg status -A
   C a.txt
 
@@ -584,3 +587,24 @@ using log status template, the copy information is displayed correctly.
   
 
   $ cd ..
+
+Make sure we expand env vars in ignore file path.
+  $ newclientrepo global-ignore-path
+  $ echo ignored > $TESTTMP/global_ignore
+  $ touch ignored
+  $ hg status --config ui.ignore='$TESTTMP/global_ignore'
+
+  $ cd ..
+
+#if symlink
+Ignore suspiciously modified symlinks.
+
+  $ newclientrepo suspicious-symlink
+  $ ln -s banana foo
+  $ hg commit -Aqm foo
+  $ rm foo
+  $ echo "not\nsymlink" > foo
+
+Force code to think we don't support symlinks to excercise code we want to test.
+  $ SL_DEBUG_DISABLE_SYMLINKS=1 hg status --config unsafe.filtersuspectsymlink=true
+#endif

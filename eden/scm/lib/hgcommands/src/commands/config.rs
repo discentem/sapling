@@ -11,12 +11,11 @@ use anyhow::bail;
 use clidispatch::abort;
 use clidispatch::abort_if;
 use clidispatch::errors;
-use clidispatch::io::IsTty;
 use clidispatch::OptionalRepo;
 use clidispatch::ReqCtx;
 use cliparser::define_flags;
+use configloader::Config;
 use configmodel::ConfigExt;
-use configparser::Config;
 use formatter::formatter::FormatOptions;
 use formatter::formatter::Formattable;
 use formatter::formatter::ListFormatter;
@@ -87,9 +86,7 @@ pub fn run(ctx: ReqCtx<ConfigOpts>, repo: &mut OptionalRepo) -> Result<u8> {
         Box::new(ctx.io().output()),
     )?;
 
-    if ctx.io().output().is_tty() {
-        ctx.io().start_pager(config)?;
-    }
+    ctx.maybe_start_pager(repo.config())?;
 
     formatter.begin_list()?;
     let exit_code = show_configs(ctx.opts.args, config, formatter.as_mut())?;
@@ -168,7 +165,8 @@ fn get_config_item<'a>(
         Some(v) => v.to_string(),
     };
 
-    let (source, builtin) = config_value_source
+    let builtin = config_value_source.source().starts_with("builtin:");
+    let source = config_value_source
         .location()
         .and_then(|(location, range)| {
             config_value_source.file_content().map(|file| {
@@ -178,18 +176,14 @@ fn get_config_item<'a>(
                     .filter(|ch| *ch == '\n')
                     .count();
                 if !location.as_os_str().is_empty() {
-                    (format!("{}:{}", location.display(), line), false)
+                    format!("{}:{}", location.display(), line)
                 } else {
                     let source = config_value_source.source();
-                    if source.to_string().as_str() == "builtin.rc" {
-                        (format!("<builtin>:{}", line), true)
-                    } else {
-                        (format!("{}:{}", source, line), false)
-                    }
+                    format!("{}:{}", source, line)
                 }
             })
         })
-        .unwrap_or_else(|| (config_value_source.source().to_string(), false));
+        .unwrap_or_else(|| config_value_source.source().to_string());
 
     Some(ConfigItem {
         source,

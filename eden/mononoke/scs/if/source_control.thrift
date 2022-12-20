@@ -362,19 +362,26 @@ struct RawDiff {
 
 /// Metadata diff (file types, summaries of added and removed lines, etc.).
 struct MetadataDiff {
-  /// File type (file, exec, or link) of the file before the change.
-  1: optional MetadataDiffFileType old_file_type;
+  /// Information about the file before the change.
+  5: MetadataDiffFileInfo old_file_info;
 
-  /// File type (file, exec, or link) of the file after the change.
-  2: optional MetadataDiffFileType new_file_type;
+  /// Information about the file after the change.
+  6: MetadataDiffFileInfo new_file_info;
 
-  /// File content type (text, non-utf8, or binary) of the file before the change.
-  /// Not yet implemented.
-  3: optional MetadataDiffFileContentType old_file_content_type;
+  /// Lines count in the diff between the two files.
+  7: optional MetadataDiffLinesCount lines_count;
+}
 
-  /// File content type (text, non-utf8, or binary) of the file after the change.
-  /// Not yet implemented.
-  4: optional MetadataDiffFileContentType new_file_content_type;
+/// File information that concerns the metadata diff.
+struct MetadataDiffFileInfo {
+  /// File type (file, exec, or link)
+  1: optional MetadataDiffFileType file_type;
+
+  /// File content type (text, non-utf8, or binary)
+  2: optional MetadataDiffFileContentType file_content_type;
+
+  /// File generated status (fully, partially, or not generated)
+  3: optional FileGeneratedStatus file_generated_status;
 }
 
 enum MetadataDiffFileType {
@@ -397,6 +404,32 @@ enum MetadataDiffFileContentType {
 
   /// File content includes NUL bytes, thus is likely to be binary
   BINARY = 3,
+}
+
+enum FileGeneratedStatus {
+  /// File is fully generated.
+  FULLY_GENERATED = 1,
+
+  /// File is partially generated (contains manual sections)
+  PARTIALLY_GENERATED = 2,
+
+  /// File is not generated.
+  NOT_GENERATED = 3,
+}
+
+/// Lines count in a diff.
+struct MetadataDiffLinesCount {
+  /// Number of added lines.
+  1: i64 added_lines_count;
+
+  /// Number of deleted lines.
+  2: i64 deleted_lines_count;
+
+  /// Number of signifcant (not generated) lines.
+  3: i64 significant_added_lines_count;
+
+  /// Number of significant (not generated) lines.
+  4: i64 significant_deleted_lines_count;
 }
 
 /// Indicates whether the file was copied or moved
@@ -913,10 +946,7 @@ struct RepoLandStackParams {
   /// Service identity to use for the bookmark move.
   6: optional string service_identity;
 
-  // TODO: Move to its own land service
-  /// INTERNAL USE ONLY: Override push source.  Leave as the default
-  /// if this is not an internal source control service.
-  101: CrossRepoPushSource __internal_only_push_source = CrossRepoPushSource.NATIVE_TO_THIS_REPO;
+  // 101: deleted
 
   /// What kind of bookmark can be pushed
   9: BookmarkKindRestrictions bookmark_restrictions = BookmarkKindRestrictions.ANY_KIND;

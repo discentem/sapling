@@ -10,11 +10,11 @@ import tempfile
 import unittest
 
 import silenttestrunner
-from bindings import configparser
+from bindings import configloader
 
 
 def createConfig():
-    return configparser.config()
+    return configloader.config()
 
 
 def normalizeSources(cfg, section, name):
@@ -82,7 +82,7 @@ class ConfigParserTests(unittest.TestCase):
             normalizeSources(cfg, "a", "y"),
             [
                 ("2", ("a.rc", 10, 11, 3), "readpath"),
-                (None, ("b.rc", 29, 36, 5), "readpath"),
+                (None, ("b.rc", 35, 36, 5), "readpath"),
             ],
         )
         self.assertEqual(

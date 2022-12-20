@@ -1211,7 +1211,7 @@ def bookmark(ui, repo, *names, **opts):
     Creating or updating to a bookmark causes it to be marked as 'active'.
     The active bookmark is indicated with a '*'.
     When a commit is made, the active bookmark will advance to the new commit.
-    A plain :prog:`update` will also advance an active bookmark, if possible.
+    A plain :prog:`goto` will also advance an active bookmark, if possible.
     Updating away from a bookmark will cause it to be deactivated.
 
     Bookmarks can be pushed and pulled between repositories (see
@@ -1817,7 +1817,7 @@ def config(ui, repo, *values, **opts):
                     fm.write("value", "%s\n", value)
                     fm.data(name=entryname)
                     matched = True
-        elif not source.startswith("<builtin>"):
+        elif not source.startswith("<builtin>") and not source.startswith("builtin:"):
             # Maintain backwards compatibility - don't write
             # builtin.rc values (formerly configitems.py) by default.
             fm.startitem()
@@ -2393,7 +2393,12 @@ def graft(ui, repo, *revs, **opts):
     Use @Product@'s merge logic to copy individual commits from other
     locations without making merge commits. This is sometimes known as
     'backporting' or 'cherry-picking'. By default, graft will also
-    copy user, date, and description from the source commits.
+    copy user and description from the source commits. If you want to
+    keep the date of the source commits, you can add below config to your
+    configuration file::
+
+      [tweakdefaults]
+      graftkeepdate = True
 
     Source commits will be skipped if they are ancestors of the
     current commit, have already been grafted, or are merges.
@@ -2423,7 +2428,7 @@ def graft(ui, repo, *revs, **opts):
 
       - copy a single change to the stable branch and edit its description::
 
-          @prog@ update stable
+          @prog@ goto stable
           @prog@ graft --edit ba7e89595
 
       - graft a range of changesets with one exception, updating dates::
@@ -4275,7 +4280,7 @@ def merge(ui, repo, node=None, **opts):
 
     See :prog:`help resolve` for information on handling file conflicts.
 
-    To undo an uncommitted merge, use :prog:`update --clean .` which
+    To undo an uncommitted merge, use :prog:`goto --clean .` which
     will check out a clean copy of the original merge parent, losing
     all changes.
 
@@ -4632,7 +4637,7 @@ def pull(ui, repo, source="default", **opts):
 
     if ui.configbool("commands", "update.requiredest") and opts.get("update"):
         msg = _("update destination required by configuration")
-        hint = _("use @prog@ pull followed by @prog@ update DEST")
+        hint = _("use @prog@ pull followed by @prog@ goto DEST")
         raise error.Abort(msg, hint=hint)
 
     # Allows us to announce larger changes affecting all the users by displaying
@@ -5477,7 +5482,7 @@ def revert(ui, repo, *pats, **opts):
         # revert after merge is a trap for new users (issue2915)
         raise error.Abort(
             _("uncommitted merge with no revision specified"),
-            hint=_("use '@prog@ update' or see '@prog@ help revert'"),
+            hint=_("use '@prog@ goto' or see '@prog@ help revert'"),
         )
 
     ctx = scmutil.revsingle(repo, opts.get("rev"))
@@ -5493,7 +5498,7 @@ def revert(ui, repo, *pats, **opts):
         if p2 != nullid:
             hint = _(
                 "uncommitted merge, use --all to discard all changes,"
-                " or '@prog@ update -C .' to abort the merge"
+                " or '@prog@ goto -C .' to abort the merge"
             )
             raise error.Abort(msg, hint=hint)
         dirty = any(repo.status())
@@ -5503,16 +5508,13 @@ def revert(ui, repo, *pats, **opts):
                 hint = (
                     _(
                         "uncommitted changes, use --all to discard all"
-                        " changes, or '@prog@ update %s' to update"
+                        " changes, or '@prog@ goto %s' to update"
                     )
                     % ctx.rev()
                 )
             else:
                 hint = (
-                    _(
-                        "use --all to revert all files,"
-                        " or '@prog@ update %s' to update"
-                    )
+                    _("use --all to revert all files," " or '@prog@ goto %s' to update")
                     % ctx.rev()
                 )
         elif dirty:
@@ -6321,7 +6323,7 @@ def update(
         if not node and not rev and not date:
             raise error.Abort(
                 _("you must specify a destination"),
-                hint=_('for example: @prog@ update ".::"'),
+                hint=_('for example: @prog@ goto ".::"'),
             )
 
     if rev is None or rev == "":

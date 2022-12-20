@@ -125,6 +125,7 @@ Show debug commands if there are no other candidates
   debugdumpdynamicconfig
   debugdumpindexedlog
   debugdumptrace
+  debugduplicatedconfig
   debugdynamicconfig
   debugedenimporthelper
   debugedenrunpostupdatehook
@@ -445,11 +446,12 @@ Show all commands + options
   debugdirs: rev, print0
   debugdirstate: nodates, datesort, json
   debugdiscovery: rev
-  debugdrawdag: print, bookmarks, write-env
+  debugdrawdag: print, bookmarks, files, write-env
   debugdryup: 
   debugdumpdynamicconfig: reponame, username, canary
   debugdumpindexedlog: 
   debugdumptrace: time-range, session-id, output-path
+  debugduplicatedconfig: style, template
   debugdynamicconfig: canary
   debugedenimporthelper: in-fd, out-fd, manifest, get-manifest-node, cat-file, cat-tree, get-file-size, fetch-tree
   debugedenrunpostupdatehook: 

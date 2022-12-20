@@ -8,7 +8,7 @@
 
 import logging
 
-from edenscm import error, git, rcutil, registrar, util
+from edenscm import error, git, gituser, rcutil, registrar, util
 from edenscm.ext.github.github_repo_util import check_github_repo
 from edenscm.i18n import _
 
@@ -223,7 +223,7 @@ def _create_ghstack_context(ui, repo):
     username_config_name = "github_username"
     github_username = ui.config(config_section, username_config_name)
     if not github_username:
-        github_username = github.graphql(
+        github_username = github.graphql_sync(
             """
 query UsernameQuery {
   viewer {
@@ -259,5 +259,13 @@ query UsernameQuery {
         default_project_dir="",
     )
     git_dir = git.readgitdir(repo)
-    sh = ghstack.sapling_shell.SaplingShell(conf=conf, git_dir=git_dir, sapling_cli=cli)
+    user_name, user_email = gituser.get_identity_or_raise(ui)
+    sh = ghstack.sapling_shell.SaplingShell(
+        conf=conf,
+        ui=ui,
+        git_dir=git_dir,
+        user_name=user_name,
+        user_email=user_email,
+        sapling_cli=cli,
+    )
     return conf, sh, github

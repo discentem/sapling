@@ -283,45 +283,10 @@ Files
 
 @Product@ reads configuration data from several files, if they exist.
 These files do not exist by default and you will have to create the
-appropriate configuration files yourself:
+appropriate configuration files yourself.
 
-Local configuration is put into the per-repository ``<repo>/.hg/hgrc`` file.
-
-Global configuration like the username setting is typically put into:
-
-.. container:: windows
-
-  - ``%USERPROFILE%\ini`` (on Windows)
-
-.. container:: unix.plan9
-
-  - ``$HOME/.hgrc`` (on Unix, Plan9)
-
-The names of these files depend on the system on which @Product@ is
-installed. ``*.rc`` files from a single directory are read in
-alphabetical order, later ones overriding earlier ones. Where multiple
-paths are given below, settings from earlier paths override later
-ones.
-
-.. container:: verbose.unix
-
-  On Unix, the following files are consulted:
-
-  - ``<repo>/.hg/hgrc`` (per-repository)
-  - ``$HOME/.hgrc`` (per-user)
-  - ``$XDG_CONFIG_HOME/hg/hgrc`` (per-user)
-  - ``/etc/mercurial/system.rc`` (per-system)
-  - ``<builtin>`` (builtin)
-
-.. container:: verbose.windows
-
-  On Windows, the following files are consulted:
-
-  - ``<repo>/.hg/hgrc`` (per-repository)
-  - ``%USERPROFILE%\.hgrc`` (per-user)
-  - ``%USERPROFILE%\@Product@.ini`` (per-user)
-  - ``%PROGRAMDATA%\Facebook\@Product@`` (per-installation)
-  - ``<builtin>`` (builtin)
+The configuration files' locations depend on the current platform. Please
+consult :prog:`configfile` to discover your platform's locations.
 
 Per-repository configuration options only apply in a
 particular repository. This file is not version-controlled, and
@@ -333,36 +298,10 @@ in these files apply to all @Product@ commands executed by this user in any
 directory. Options in these files override per-system and per-installation
 options.
 
-Per-installation configuration files are searched for in the
-directory where @Product@ is installed. ``<install-root>`` is the
-parent directory of the **hg** executable (or symlink) being run.
-
-.. container:: unix.plan9
-
-  For example, if installed in ``/shared/tools/bin/hg``, @Product@
-  will look in ``/shared/tools/etc/mercurial/hgrc``. Options in these
-  files apply to all @Product@ commands executed by any user in any
-  directory.
-
-Per-installation configuration files are for the system on
-which @Product@ is running. Options in these files apply to all
-@Product@ commands executed by any user in any directory. Registry
-keys contain PATH-like strings, every part of which must reference
-a ``@Product@.ini`` file or be a directory where ``*.rc`` files will
-be read.  @Product@ checks each of these locations in the specified
-order until one or more configuration files are detected.
-
 Per-system configuration files are for the system on which @Product@
 is running. Options in these files apply to all @Product@ commands
 executed by any user in any directory. Options in these files
 override per-installation options.
-
-@Product@ comes with some default configuration. The default configuration
-files are installed with @Product@ and will be overwritten on upgrades. Default
-configuration files should never be edited by users or administrators but can
-be overridden in other configuration files. So far the directory only contains
-merge tool configuration but packagers can also put other default configuration
-there.
 
 Warning: Running @prog@ inside, pushing to, pulling from, or cloning local
 repositories owned by other users will load the their config files. That could
@@ -433,7 +372,7 @@ the configuration file in which the ``%include`` directive is found.
 Environment variables and ``~user`` constructs are expanded in
 ``file``. This lets you do something like::
 
-  %include ~/.hgrc.d/$HOST.rc
+  %include ~/.@prog@/$HOST.config
 
 to include a different configuration file on each computer you use.
 
@@ -651,7 +590,7 @@ effect and style see :prog:`help color`.
     (default: False)
 
 ``update.check``
-    Determines what level of checking :prog:`update` will perform before moving
+    Determines what level of checking :prog:`goto` will perform before moving
     to a destination revision. Valid values are ``abort``, ``none``,
     ``linear``, and ``noconflict``. ``abort`` always fails if the working
     directory has uncommitted changes. ``none`` performs no checking, and may
@@ -663,8 +602,8 @@ effect and style see :prog:`help color`.
     (default: ``linear``)
 
 ``update.requiredest``
-    Require that the user pass a destination when running :prog:`update`.
-    For example, :prog:`update .::` will be allowed, but a plain :prog:`update`
+    Require that the user pass a destination when running :prog:`goto`.
+    For example, :prog:`goto .::` will be allowed, but a plain :prog:`goto`
     will be disallowed.
     (default: False)
 
@@ -700,38 +639,38 @@ one shown by default::
 
     [committemplate]
     changeset = {desc}\n\n
-        HG: Enter commit message.  Lines beginning with 'HG:' are removed.
-        HG: {extramsg}
-        HG: --
-        HG: user: {author}\n{ifeq(p2rev, "-1", "",
-       "HG: branch merge\n")
-       }HG: branch '{branch}'\n{if(activebookmark,
-       "HG: bookmark '{activebookmark}'\n")   }{file_adds %
-       "HG: added {file}\n"                   }{file_mods %
-       "HG: changed {file}\n"                 }{file_dels %
-       "HG: removed {file}\n"                 }{if(files, "",
-       "HG: no files changed\n")}
+        @PROG@: Enter commit message.  Lines beginning with '@PROG@:' are removed.
+        @PROG@: {extramsg}
+        @PROG@: --
+        @PROG@: user: {author}\n{ifeq(p2rev, "-1", "",
+       "@PROG@: branch merge\n")
+       }@PROG@: branch '{branch}'\n{if(activebookmark,
+       "@PROG@: bookmark '{activebookmark}'\n")   }{file_adds %
+       "@PROG@: added {file}\n"                   }{file_mods %
+       "@PROG@: changed {file}\n"                 }{file_dels %
+       "@PROG@: removed {file}\n"                 }{if(files, "",
+       "@PROG@: no files changed\n")}
 
 ``diff()``
     String: show the diff (see :prog:`help templates` for detail)
 
 Sometimes it is helpful to show the diff of the changeset in the editor without
-having to prefix 'HG: ' to each line so that highlighting works correctly. For
+having to prefix '@PROG@: ' to each line so that highlighting works correctly. For
 this, @Product@ provides a special string which will ignore everything below
 it::
 
-     HG: ------------------------ >8 ------------------------
+     @PROG@: ------------------------ >8 ------------------------
 
 For example, the template configuration below will show the diff below the
 extra message::
 
     [committemplate]
     changeset = {desc}\n\n
-        HG: Enter commit message.  Lines beginning with 'HG:' are removed.
-        HG: {extramsg}
-        HG: ------------------------ >8 ------------------------
-        HG: Do not touch the line above.
-        HG: Everything below will be removed.
+        @PROG@: Enter commit message.  Lines beginning with '@PROG@:' are removed.
+        @PROG@: {extramsg}
+        @PROG@: ------------------------ >8 ------------------------
+        @PROG@: Do not touch the line above.
+        @PROG@: Everything below will be removed.
         {diff()}
 
 .. note::
@@ -805,10 +744,10 @@ below can be referred as ``{listupfiles}``::
 
     [committemplate]
     listupfiles = {file_adds %
-       "HG: added {file}\n"     }{file_mods %
-       "HG: changed {file}\n"   }{file_dels %
-       "HG: removed {file}\n"   }{if(files, "",
-       "HG: no files changed\n")}
+       "@PROG@: added {file}\n"     }{file_mods %
+       "@PROG@: changed {file}\n"   }{file_dels %
+       "@PROG@: removed {file}\n"   }{if(files, "",
+       "@PROG@: no files changed\n")}
 
 ``common``
 ------------------
@@ -1017,11 +956,11 @@ Otherwise, give a name that you choose, followed by ``=``, followed by
 the path to the ``.py`` file (including the file name extension) that
 defines the extension.
 
-To explicitly disable an extension that is enabled in an hgrc of
+To explicitly disable an extension that is enabled in a config file of
 broader scope, prepend its path with ``!``, as in ``foo = !/ext/path``
 or ``foo = !`` when path is not supplied.
 
-Example for ``~/.hgrc``::
+Example for ``sapling.conf``::
 
   [extensions]
   # (the amend extension will get loaded from @Product@'s path)
@@ -1101,7 +1040,7 @@ Some commands show hints about features, like::
     hint[import]: use '@prog@ import' to import commits exported by '@prog@ export'
 
 They can be silenced by ``@prog@ hint --ack import``, which writes the
-``hint.ack`` config in user hgrc.
+``hint.ack`` config to the user config.
 
 ``ack``
     A list of hint IDs that were acknowledged so they will not
@@ -1118,11 +1057,11 @@ value or setting it to an empty string.  Hooks can be prioritized
 by adding a prefix of ``priority.`` to the hook name on a new line
 and setting the priority. The default priority is 0.
 
-Example ``.hg/hgrc``::
+Example ``.@prog@/config``::
 
   [hooks]
   # update working directory after adding changesets
-  changegroup.update = @prog@ update
+  changegroup.update = @prog@ goto
   # do not use the site-wide hook
   incoming =
   incoming.email = /my/email/hook
@@ -1628,7 +1567,7 @@ merges. This section has likely been preconfigured at install time.
 Use :prog:`config merge-tools` to check the existing configuration.
 Also see :prog:`help merge-tools` for more details.
 
-Example ``~/.hgrc``::
+Example ``sapling.conf``::
 
   [merge-tools]
   # Override stock tool location
@@ -2598,9 +2537,9 @@ User interface controls.
     username are expanded.
 
     (default: ``$EMAIL`` or ``username@hostname``. If the username in
-    hgrc is empty, e.g. if the system admin set ``username =`` in the
-    system hgrc, it has to be specified manually or in a different
-    hgrc file)
+    the config is empty, e.g. if the system admin set ``username =`` in the
+    system config, it has to be specified manually or in a different
+    config file)
 
 ``verbose``
     Increase the amount of output printed. (default: False)
@@ -2803,7 +2742,7 @@ HGRCPATH
     A list of files or directories to search for configuration
     files. Item separator is ":" on Unix, ";" on Windows. If HGRCPATH
     is not set, platform default search path is used. If empty, only
-    the .hg/hgrc from the current repository is read.
+    the current repository config is read.
 
     For each element in HGRCPATH:
 
@@ -3065,13 +3004,13 @@ List flags take multiple values. To specify them, pass the flag multiple times::
 Setting flag defaults
 =====================
 
-In order to set a default value for a flag in an hgrc file, it is recommended to
+In order to set a default value for a flag in a config file, it is recommended to
 use aliases::
 
     [alias]
     commit = commit --interactive
 
-For more information on hgrc files, see :prog:`help config`.
+For more information on config files, see :prog:`help config`.
 
 Overriding flags on the command line
 ====================================
@@ -3093,7 +3032,7 @@ then the following command will override that -m::
 Overriding flag defaults
 ========================
 
-Every flag has a default value, and you may also set your own defaults in hgrc
+Every flag has a default value, and you may also set your own defaults
 as described above.
 Except for list flags, defaults can be overridden on the command line simply by
 specifying the flag in that location.
@@ -3120,7 +3059,7 @@ Bookmark
     Bookmarks are pointers to certain commits that move when
     committing. They are similar to tags in that it is possible to use
     bookmark names in all places where @Product@ expects a changeset
-    ID, e.g., with :prog:`update`. Unlike tags, bookmarks move along
+    ID, e.g., with :prog:`goto`. Unlike tags, bookmarks move along
     when you make a commit.
 
     Bookmarks can be renamed, copied and deleted. Bookmarks are local,
@@ -3399,7 +3338,7 @@ Parent, working directory
     The working directory parent reflects a virtual revision which is
     the child of the changeset (or two changesets with an uncommitted
     merge) shown by :prog:`parents`. This is changed with
-    :prog:`update`. Other commands to see the working directory parent
+    :prog:`goto`. Other commands to see the working directory parent
     are :prog:`summary` and :prog:`id`. Can be specified by the alias ".".
 
 Patch
@@ -3448,7 +3387,7 @@ Repository head
 
 Revision
     A state of the repository at some point in time. Earlier revisions
-    can be updated to by using :prog:`update`.  See also 'Revision
+    can be updated to by using :prog:`goto`.  See also 'Revision
     number'; See also 'Changeset'.
 
 Revision number
@@ -3481,7 +3420,7 @@ Secret
 Tag
     An alternative name given to a changeset. Tags can be used in all
     places where @Product@ expects a changeset ID, e.g., with
-    :prog:`update`. The creation of a tag is stored in the history and
+    :prog:`goto`. The creation of a tag is stored in the history and
     will thus automatically be shared with other using push and pull.
 
 Tip
@@ -3523,7 +3462,7 @@ file. Merge tools are given the two files and the greatest common
 ancestor of the two file versions, so they can determine the changes
 made on both branches.
 
-Merge tools are used both for :prog:`resolve`, :prog:`merge`, :prog:`update`,
+Merge tools are used both for :prog:`resolve`, :prog:`merge`, :prog:`goto`,
 :prog:`backout` and in several extensions.
 
 Usually, the merge tool tries to automatically reconcile the files by
@@ -3537,9 +3476,9 @@ programs but relies on external tools for that.
 Available merge tools
 =====================
 
-External merge tools and their properties are configured in the
-merge-tools configuration section - see hgrc(5) - but they can often just
-be named by their executable.
+External merge tools and their properties are configured in the merge-tools
+configuration section - see :prog:`help config.merge-tools` - but they can often
+just be named by their executable.
 
 A merge tool is generally usable if its executable can be found on the
 system and if it can handle the merge. The executable is found if it
@@ -3599,7 +3538,7 @@ Choosing a merge tool
    controlled by the premerge setting of the merge tool. Premerge is enabled by
    default unless the file is binary or a symlink.
 
-See the merge-tools and ui sections of hgrc(5) for details on the
+See the merge-tools and ui sections of :prog:`help config` for details on the
 configuration of merge tools.
 """
 
@@ -3858,7 +3797,7 @@ working directory is checked out, it is equivalent to null. If an
 uncommitted merge is in progress, "." is the revision of the first
 parent.
 
-Finally, commands that expect a single revision (like ``@prog@ update``) also
+Finally, commands that expect a single revision (like ``@prog@ goto``) also
 accept revsets (see below for details). When given a revset, they use the
 last revision of the revset. A few commands accept two single revisions
 (like ``@prog@ diff``). When given a revset, they use the first and the last
@@ -4044,7 +3983,7 @@ Some sample queries:
 - Update to the commit that bookmark @ is pointing to, without activating the
   bookmark (this works because the last revision of the revset is used)::
 
-    @prog@ update :@
+    @prog@ goto :@
 
 - Show diff between tags 1.3 and 1.5 (this works because the first and the
   last revisions of the revset are used)::

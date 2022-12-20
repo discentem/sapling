@@ -128,7 +128,8 @@ def _hashrepostate(repo) -> bytes:
     The hash is used to detect repo changes.
     """
     buf = []
-    ml = repo.metalog()
+    with repo.wlock(), repo.lock(), repo.transaction("cloudsyncmetalog"):
+        ml = repo.metalog()
     for key in ["bookmarks", "remotenames", "visibleheads"]:
         buf.append(ml.get(key) or b"")
     return hashlib.sha1(b"".join(buf)).digest()
@@ -393,7 +394,7 @@ def _maybeupdateworkingcopy(repo, currentnode):
         ui.status(
             _(
                 "current revision %s has been replaced remotely with multiple revisions\n"
-                "(run '@prog@ update HASH' to go to the desired revision)\n"
+                "(run '@prog@ goto HASH' to go to the desired revision)\n"
             )
             % nodemod.short(currentnode),
             component="commitcloud",

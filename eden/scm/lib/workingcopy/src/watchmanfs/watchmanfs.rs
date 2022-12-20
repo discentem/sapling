@@ -17,6 +17,7 @@ use io::IO;
 use manifest_tree::ReadTreeManifest;
 use parking_lot::Mutex;
 use pathmatcher::Matcher;
+use progress_model::ProgressBar;
 use repolock::RepoLocker;
 use treestate::treestate::TreeState;
 use vfs::VFS;
@@ -58,7 +59,12 @@ impl WatchmanFileSystem {
         })
     }
 
+    #[tracing::instrument(skip_all, err)]
     async fn query_result(&self, state: &WatchmanState) -> Result<QueryResult<StatusQuery>> {
+        let start = std::time::Instant::now();
+
+        let _bar = ProgressBar::register_new("querying watchman", 0, "");
+
         let client = Connector::new().connect().await?;
         let resolved = client
             .resolve_root(CanonicalPath::canonicalize(self.vfs.root())?)
@@ -76,10 +82,13 @@ impl WatchmanFileSystem {
                 QueryRequestCommon {
                     since: state.get_clock(),
                     expression: Some(Expr::Not(Box::new(excludes))),
+                    sync_timeout: state.sync_timeout(),
                     ..Default::default()
                 },
             )
             .await?;
+
+        tracing::trace!(target: "measuredtimes", watchmanquery_time=start.elapsed().as_millis());
 
         Ok(result)
     }
@@ -93,12 +102,21 @@ impl PendingChanges for WatchmanFileSystem {
         config: &dyn Config,
         io: &IO,
     ) -> Result<Box<dyn Iterator<Item = Result<PendingChangeResult>>>> {
-        let state = WatchmanState::new(WatchmanTreeState {
-            treestate: self.treestate.clone(),
-            root: self.vfs.root(),
-        })?;
+        let state = WatchmanState::new(
+            config,
+            WatchmanTreeState {
+                treestate: self.treestate.clone(),
+                root: self.vfs.root(),
+            },
+        )?;
 
         let result = async_runtime::block_on(self.query_result(&state))?;
+
+        tracing::debug!(
+            target: "watchman_info",
+            watchmanfreshinstances= if result.is_fresh_instance { 1 } else { 0 },
+            watchmanfilecount=result.files.as_ref().map_or(0, |f| f.len()),
+        );
 
         let should_warn = config.get_or_default("fsmonitor", "warn-fresh-instance")?;
         if result.is_fresh_instance && should_warn {

@@ -19,10 +19,14 @@ use mononoke_api::ChangesetContext;
 use mononoke_api::ChangesetId;
 use mononoke_api::ChangesetPathContentContext;
 use mononoke_api::CopyInfo;
+use mononoke_api::FileContentType;
+use mononoke_api::FileGeneratedStatus;
 use mononoke_api::FileMetadata;
 use mononoke_api::FileType;
 use mononoke_api::HeaderlessUnifiedDiff;
 use mononoke_api::MetadataDiff;
+use mononoke_api::MetadataDiffFileInfo;
+use mononoke_api::MetadataDiffLinesCount;
 use mononoke_api::MononokeError;
 use mononoke_api::PushrebaseOutcome;
 use mononoke_api::RepoContext;
@@ -175,13 +179,63 @@ impl IntoResponse<thrift::CopyInfo> for CopyInfo {
     }
 }
 
+impl IntoResponse<Option<thrift::MetadataDiffFileContentType>> for Option<FileContentType> {
+    fn into_response(self) -> Option<thrift::MetadataDiffFileContentType> {
+        match self {
+            None => None,
+            Some(FileContentType::Text) => Some(thrift::MetadataDiffFileContentType::TEXT),
+            Some(FileContentType::NonUtf8) => Some(thrift::MetadataDiffFileContentType::NON_UTF8),
+            Some(FileContentType::Binary) => Some(thrift::MetadataDiffFileContentType::BINARY),
+        }
+    }
+}
+
+impl IntoResponse<Option<thrift::FileGeneratedStatus>> for Option<FileGeneratedStatus> {
+    fn into_response(self) -> Option<thrift::FileGeneratedStatus> {
+        match self {
+            None => None,
+            Some(FileGeneratedStatus::FullyGenerated) => {
+                Some(thrift::FileGeneratedStatus::FULLY_GENERATED)
+            }
+            Some(FileGeneratedStatus::PartiallyGenerated) => {
+                Some(thrift::FileGeneratedStatus::PARTIALLY_GENERATED)
+            }
+            Some(FileGeneratedStatus::NotGenerated) => {
+                Some(thrift::FileGeneratedStatus::NOT_GENERATED)
+            }
+        }
+    }
+}
+
+impl IntoResponse<thrift::MetadataDiffFileInfo> for MetadataDiffFileInfo {
+    fn into_response(self) -> thrift::MetadataDiffFileInfo {
+        thrift::MetadataDiffFileInfo {
+            file_type: self.file_type.into_response(),
+            file_content_type: self.file_content_type.into_response(),
+            file_generated_status: self.file_generated_status.into_response(),
+            ..Default::default()
+        }
+    }
+}
+
+impl IntoResponse<Option<thrift::MetadataDiffLinesCount>> for Option<MetadataDiffLinesCount> {
+    fn into_response(self) -> Option<thrift::MetadataDiffLinesCount> {
+        self.map(|lines_count| thrift::MetadataDiffLinesCount {
+            added_lines_count: lines_count.added_lines_count as i64,
+            deleted_lines_count: lines_count.deleted_lines_count as i64,
+            significant_added_lines_count: lines_count.significant_added_lines_count as i64,
+            significant_deleted_lines_count: lines_count.significant_deleted_lines_count as i64,
+            ..Default::default()
+        })
+    }
+}
+
 impl IntoResponse<thrift::Diff> for MetadataDiff {
     fn into_response(self) -> thrift::Diff {
-        let old_file_type = self.old_file_type.into_response();
-        let new_file_type = self.new_file_type.into_response();
         thrift::Diff::metadata_diff(thrift::MetadataDiff {
-            old_file_type,
-            new_file_type,
+            old_file_info: self.old_file_info.into_response(),
+            new_file_info: self.new_file_info.into_response(),
+            lines_count: self.lines_count.into_response(),
             ..Default::default()
         })
     }

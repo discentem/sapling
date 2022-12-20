@@ -138,7 +138,6 @@ _ = i18n._
 bindunixsocket = platform.bindunixsocket
 cachestat = platform.cachestat
 checkexec = platform.checkexec
-checklink = platform.checklink
 copymode = platform.copymode
 executablepath = platform.executablepath
 expandglobs = platform.expandglobs
@@ -169,7 +168,6 @@ parsepatchoutput = platform.parsepatchoutput
 pconvert = platform.pconvert
 popen = platform.popen
 posixfile = platform.posixfile
-quotecommand = platform.quotecommand
 readlock = platform.readlock
 releaselock = platform.releaselock
 removedirs = platform.removedirs
@@ -211,6 +209,13 @@ except AttributeError:
 # Python compatibility
 
 _notset = object()
+
+
+def checklink(path: str) -> bool:
+    if os.environ.get("SL_DEBUG_DISABLE_SYMLINKS"):
+        return False
+
+    return platform.checklink(path)
 
 
 def safehasattr(thing, attr):
@@ -1236,7 +1241,15 @@ def rawsystem(cmd, environ=None, cwd=None, out=None):
         stdout.flush()
     except Exception:
         pass
-    cmd = quotecommand(cmd)
+
+    # Tripwire output to help identity relative script invocation that may not
+    # work on Windows. We are looking relative path like "foo/bar" which work on
+    # unix but not Windows.
+    if istest():
+        parent, _basename = os.path.split(cmd.split()[0])
+        if parent and not os.path.isabs(parent):
+            mainio.write_err(f"command '{cmd}' should use absolute path\n".encode())
+
     env = shellenviron(environ)
     if out is None or isatty(out) or isstdout(out):
         # If out is a tty (most likely stdout), then do not use subprocess.PIPE.

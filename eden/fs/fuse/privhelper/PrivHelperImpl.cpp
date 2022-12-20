@@ -86,8 +86,8 @@ class PrivHelperClientImpl : public PrivHelper,
     {
       auto state = state_.wlock();
       if (state->status != Status::NOT_STARTED) {
-        throw_<std::runtime_error>(
-            "PrivHelper::start() called in unexpected state ",
+        throwf<std::runtime_error>(
+            "PrivHelper::start() called in unexpected state {}",
             static_cast<uint32_t>(state->status));
       }
       state->eventBase = eventBase;
@@ -255,16 +255,16 @@ class PrivHelperClientImpl : public PrivHelper,
 
   void processResponse(UnixSocket::Message&& message) {
     Cursor cursor(&message.data);
-    auto xid = cursor.readBE<uint32_t>();
+    PrivHelperConn::PrivHelperPacket packet =
+        PrivHelperConn::parsePacket(cursor);
 
-    auto iter = pendingRequests_.find(xid);
+    auto iter = pendingRequests_.find(packet.metadata.transaction_id);
     if (iter == pendingRequests_.end()) {
       // This normally shouldn't happen unless there is a bug.
       // We'll throw and our caller will turn this into an EDEN_BUG()
-      throw_<std::runtime_error>(
-          "received unexpected response from privhelper for unknown "
-          "transaction ID ",
-          xid);
+      throwf<std::runtime_error>(
+          "received unexpected response from privhelper for unknown transaction ID {}",
+          packet.metadata.transaction_id);
     }
 
     auto promise = std::move(iter->second);
@@ -378,9 +378,9 @@ Future<File> PrivHelperClientImpl::fuseMount(
         PrivHelperConn::parseEmptyResponse(
             PrivHelperConn::REQ_MOUNT_FUSE, response);
         if (response.files.size() != 1) {
-          throw_<std::runtime_error>(
+          throwf<std::runtime_error>(
               "expected privhelper FUSE response to contain a single file "
-              "descriptor; got ",
+              "descriptor; got {}",
               response.files.size());
         }
         return std::move(response.files[0]);
@@ -537,9 +537,9 @@ unique_ptr<PrivHelper>
 startOrConnectToPrivHelper(const UserInfo& userInfo, int argc, char** argv) {
   std::string helperPathFromArgs;
 
-  // We can't use FLAGS_ here because we are called before folly::init() and
-  // the args haven't been parsed. We do a very simple iteration here to parse
-  // out the options.
+  // We can't use FLAGS_ here because startOrConnectToPrivHelper() is called
+  // before folly::init() and the args haven't been parsed yet. We do a very
+  // simple iteration here to parse out the options.
 
   // But at least reference the symbol so it's included in the binary.
   void* volatile fd_arg = &FLAGS_privhelper_fd;
@@ -548,8 +548,8 @@ startOrConnectToPrivHelper(const UserInfo& userInfo, int argc, char** argv) {
   for (int i = 1; i < argc - 1; ++i) {
     StringPiece arg{argv[i]};
     if (arg == "--privhelper_fd") {
-      // If we were passed the --privhelper_fd option (eg: by
-      // daemonizeIfRequested) then we have a channel through which we can
+      // If EdenFS was passed the --privhelper_fd option (eg: by
+      // daemonizeIfRequested) then it has a channel through which it can
       // communicate with a previously spawned privhelper process. Return a
       // client constructed from that channel.
       if ((i + 1) >= argc) {
@@ -570,37 +570,47 @@ startOrConnectToPrivHelper(const UserInfo& userInfo, int argc, char** argv) {
 
   SpawnedProcess::Options opts;
 
-  // If are as running as setuid, we need to be cautious about the privhelper
-  // process that we are about start.
-  // We require that `edenfs_privhelper` be a sibling of our executable file,
-  // and that both of these paths are not symlinks, and that both are owned
-  // and controlled by the same user.
+  // If EdenFS is running as setuid-root, it needs to be cautious about the
+  // privhelper process that it's about start. Note: from a standard release
+  // package, this is unlikely because the privhelper daemon is installed as
+  // setuid-root and this allows us to avoid running the EdenFS executable as
+  // setuid-root. All warnings will stay in the code since outside users should
+  // be aware of the security implications of changing this code.
+  //
+  // This code require that both of these paths (the EdenFS exe and the
+  // privhelper daemon) are not symlinks and that both are owned and controlled
+  // by the same user (unless the privhelper daemon is owned by root).
 
   auto exePath = executablePath();
   auto canonPath = realpath(exePath.c_str());
   if (exePath != canonPath) {
-    throw_<std::runtime_error>(
-        "Refusing to start because my exePath ",
+    throwf<std::runtime_error>(
+        "Refusing to start because my exePath {} is not the realpath to myself"
+        " (which is {}). This is an unsafe installation and may be an"
+        " indication of a symlink attack or similar attempt to escalate"
+        " privileges.",
         exePath,
-        " is not the realpath to myself (which is ",
-        canonPath,
-        "). This is an unsafe installation and may be an indication of a "
-        "symlink attack or similar attempt to escalate privileges");
+        canonPath);
   }
 
   bool isSetuid = getuid() != geteuid();
 
   AbsolutePath helperPath;
 
-  if (helperPathFromArgs.empty()) {
-    helperPath = exePath.dirname() + "edenfs_privhelper"_relpath;
-  } else {
+  // We should ALWAYS hit the first branch if running through official channels
+  // (i.e. `eden start` and other internal methods), but there's a chance the
+  // binary is invoked directly without --privhelper-path passed. In that case,
+  // fall back to searching for a privhelper binary relative to the executable.
+  if (!helperPathFromArgs.empty()) {
     if (isSetuid) {
       throw std::invalid_argument(
           "Cannot provide privhelper_path when executing a setuid binary");
     }
     helperPath = canonicalPath(helperPathFromArgs);
+  } else {
+    helperPath = exePath.dirname() + "edenfs_privhelper"_relpath;
   }
+  XLOGF(DBG1, "Using '%s' as the privhelper daemon.\n", helperPath.c_str());
 
   struct stat helperStat {};
   struct stat selfStat {};
@@ -612,39 +622,45 @@ startOrConnectToPrivHelper(const UserInfo& userInfo, int argc, char** argv) {
       fmt::format("lstat {}", helperPath));
 
   if (isSetuid) {
-    // We are a setuid binary.  Require that our executable be owned by
-    // root, otherwise refuse to continue on the basis that something is
-    // very fishy.
+    // Note: In a standard release package, the privhelper daemon is setuid-root
+    // and the EdenFS executable is NOT. Therefore, the following is an unlikely
+    // scenario. This comment/code is a warning to anyone who modifies this code
+    // that there are major risks if shipping/running the EdenFS daemon as
+    // setuid-root.
+    //
+    // When the EdenFS executable is a setuid binary: Require that our
+    // executable be owned by root, otherwise refuse to continue on the basis
+    // that something is very fishy.
     if (selfStat.st_uid != 0) {
-      throw_<std::runtime_error>(
-          "Refusing to start because my exePath ",
+      throwf<std::runtime_error>(
+          "Refusing to start because my exePath {} is owned by uid {} rather"
+          " than by root.",
           exePath,
-          "is owned by uid ",
-          selfStat.st_uid,
-          " rather than by root.");
+          selfStat.st_uid);
     }
   }
 
-  if (selfStat.st_uid != helperStat.st_uid ||
-      selfStat.st_gid != helperStat.st_gid) {
-    throw_<std::runtime_error>(
-        "Refusing to start because my exePath ",
+  // This is not a concern if the privhelper is setuid-root. At that point,
+  // there are bigger concerns than our uid/gid not matching. In addition, we
+  // want dev EdenFS instances to be able to use system (setuid-root) privhelper
+  // binaries while being run as a non-root user.
+  if ((helperStat.st_uid != 0 && (selfStat.st_uid != helperStat.st_uid)) ||
+      (helperStat.st_gid != 0 && (selfStat.st_gid != helperStat.st_gid))) {
+    throwf<std::runtime_error>(
+        "Refusing to start because my exePath {} is owned by uid={} gid={} and"
+        " that doesn't match the ownership of {} which is owned by uid={}"
+        " gid={}",
         exePath,
-        "is owned by uid=",
         selfStat.st_uid,
-        " gid=",
         selfStat.st_gid,
-        " and that doesn't match the ownership of ",
         helperPath,
-        "which is owned by uid=",
         helperStat.st_uid,
-        " gid=",
         helperStat.st_gid);
   }
 
   if (S_ISLNK(helperStat.st_mode)) {
-    throw_<std::runtime_error>(
-        "Refusing to start because ", helperPath, " is a symlink");
+    throwf<std::runtime_error>(
+        "Refusing to start because {} is a symlink", helperPath);
   }
 
   opts.executablePath(helperPath);
@@ -673,45 +689,6 @@ startOrConnectToPrivHelper(const UserInfo& userInfo, int argc, char** argv) {
 unique_ptr<PrivHelper> createTestPrivHelper(File&& conn) {
   return make_unique<PrivHelperClientImpl>(std::move(conn), std::nullopt);
 }
-
-#ifdef __linux__
-std::unique_ptr<PrivHelper> forkPrivHelper(
-    PrivHelperServer* server,
-    const UserInfo& userInfo) {
-  File clientConn;
-  File serverConn;
-  PrivHelperConn::createConnPair(clientConn, serverConn);
-
-  const auto pid = fork();
-  checkUnixError(pid, "failed to fork mount helper");
-  if (pid > 0) {
-    // Parent
-    serverConn.close();
-    XLOG(DBG1) << "Forked mount helper process: pid=" << pid;
-    return make_unique<PrivHelperClientImpl>(
-        std::move(clientConn), SpawnedProcess::fromExistingProcess(pid));
-  }
-
-  // Child
-  clientConn.close();
-  int rc = 1;
-  try {
-    // Redirect stdin
-    folly::File devNullIn("/dev/null", O_RDONLY);
-    auto retcode = folly::dup2NoInt(devNullIn.fd(), STDIN_FILENO);
-    folly::checkUnixError(retcode, "failed to redirect stdin");
-
-    server->init(std::move(serverConn), userInfo.getUid(), userInfo.getGid());
-    server->run();
-    rc = 0;
-  } catch (const std::exception& ex) {
-    XLOG(ERR) << "error inside mount helper: " << folly::exceptionStr(ex);
-  } catch (...) {
-    XLOG(ERR) << "invalid type thrown inside mount helper";
-  }
-  _exit(rc);
-}
-#endif
 
 #else // _WIN32
 

@@ -341,25 +341,6 @@ facebook::eden::InodePtr inodeFromUserPath(
   return mount.getInodeSlow(relPath, context).get();
 }
 
-/**
- * Convert an arbitrary Thrift path to a canonicalized AbsolutePath
- *
- * May throw if the path is malformed.
- */
-AbsolutePath absolutePathFromThrift(StringPiece path) {
-  return canonicalPath(path);
-}
-
-/**
- * Convert an AbsolutePath to a Thrift path.
- *
- * In particular on Windows, AbsolutePath are UNC paths internally, but the UNC
- * prefix is stripped when sending the path to Thrift.
- */
-std::string absolutePathToThrift(AbsolutePathPiece path) {
-  return path.stringWithoutUNC();
-}
-
 } // namespace
 
 // INSTRUMENT_THRIFT_CALL returns a unique pointer to
@@ -2647,7 +2628,7 @@ EdenServiceHandler::semifuture_globFiles(std::unique_ptr<GlobParams> params) {
   auto& context = helper->getFetchContext();
   auto isBackground = *params->background();
 
-  ImmediateFuture<folly::Unit> backgroundFuture;
+  ImmediateFuture<folly::Unit> backgroundFuture{std::in_place};
   if (isBackground) {
     backgroundFuture = makeNotReadyImmediateFuture();
   }
@@ -2687,7 +2668,7 @@ folly::SemiFuture<folly::Unit> EdenServiceHandler::semifuture_prefetchFiles(
   auto& context = helper->getFetchContext();
   auto isBackground = *params->background();
 
-  ImmediateFuture<folly::Unit> backgroundFuture;
+  ImmediateFuture<folly::Unit> backgroundFuture{std::in_place};
   if (isBackground) {
     backgroundFuture = makeNotReadyImmediateFuture();
   }
@@ -2880,14 +2861,12 @@ EdenServiceHandler::semifuture_debugGetBlob(
   std::vector<ImmediateFuture<ScmBlobWithOrigin>> blobFutures;
 
   if (originFlags.contains(FROMWHERE_MEMORY_CACHE)) {
-    // TODO(kmancini): implement
     blobFutures.emplace_back(
         ImmediateFuture<ScmBlobWithOrigin>{getBlobFromOrigin(
             edenMount,
             id,
-            folly::Try<std::unique_ptr<Blob>>(newEdenError(
-                EdenErrorType::GENERIC_ERROR,
-                "direct fetching from object cache not yet supported.")),
+            folly::Try<std::shared_ptr<const Blob>>{
+                edenMount->getBlobCache()->get(id).object},
             DataFetchOrigin::MEMORY_CACHE)});
   }
   if (originFlags.contains(FROMWHERE_DISK_CACHE)) {
@@ -3479,20 +3458,31 @@ EdenServiceHandler::semifuture_debugInvalidateNonMaterialized(
   auto edenMount = server_->getMount(mountPath);
   auto& fetchContext = helper->getFetchContext();
 
-  if (!(params->age()->seconds() == 0 && params->age()->nanoSeconds() == 0)) {
-    throw newEdenError(
-        EINVAL, EdenErrorType::ARGUMENT_ERROR, "Non-zero age is not supported");
-  }
-
   TreeInodePtr inode =
       inodeFromUserPath(*edenMount, *params->path(), fetchContext).asTreePtr();
+
+  if (!folly::kIsWindows) {
+    if (!(params->age()->seconds() == 0 && params->age()->nanoSeconds() == 0)) {
+      throw newEdenError(
+          EINVAL,
+          EdenErrorType::ARGUMENT_ERROR,
+          "Non-zero age is not supported on non-Windows platforms");
+    }
+  }
+
+  auto cutoff = std::chrono::system_clock::time_point::max();
+  if (*params->age()->seconds() != 0) {
+    cutoff = std::chrono::system_clock::now() -
+        std::chrono::seconds(*params->age()->seconds());
+  }
 
   return wrapImmediateFuture(
              std::move(helper),
              waitForPendingNotifications(*edenMount, *params->sync())
-                 .thenValue([inode = std::move(inode),
-                             &fetchContext](auto&&) mutable {
-                   return inode->invalidateChildrenNotMaterialized(fetchContext)
+                 .thenValue([inode = std::move(inode), cutoff, &fetchContext](
+                                auto&&) mutable {
+                   return inode
+                       ->invalidateChildrenNotMaterialized(cutoff, fetchContext)
                        .ensure([inode]() {
                          inode->unloadChildrenUnreferencedByFs();
                        })

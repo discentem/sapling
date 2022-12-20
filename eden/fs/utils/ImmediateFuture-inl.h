@@ -15,45 +15,55 @@ template <typename T>
 void ImmediateFuture<T>::destroy() {
   switch (kind_) {
     case Kind::Immediate:
-      using TryType = folly::Try<T>;
-      immediate_.~TryType();
+      kind_ = Kind::Nothing;
+      immediate_.~Try();
       break;
     case Kind::SemiFuture:
     case Kind::LazySemiFuture:
-      using SemiFutureType = folly::SemiFuture<T>;
-      semi_.~SemiFutureType();
+      kind_ = Kind::Nothing;
+      semi_.~SemiFuture();
       break;
     case Kind::Nothing:
       break;
   }
-  kind_ = Kind::Nothing;
 }
 
 template <typename T>
-ImmediateFuture<T>::ImmediateFuture(folly::Try<T>&& value) noexcept(
-    std::is_nothrow_move_constructible_v<folly::Try<T>>) {
+template <typename... Args>
+ImmediateFuture<T>::ImmediateFuture(std::in_place_t, Args&&... args) noexcept(
+    std::is_nothrow_constructible_v<T, Args&&...>)
+    // Initializing kind_ before immediate_ is legal because kind_
+    // initialization is nothrow.
+    : kind_{Kind::Immediate},
+      immediate_{folly::in_place, std::forward<Args>(args)...} {}
+
+template <typename T>
+ImmediateFuture<T>::ImmediateFuture(folly::Try<T>&& value) noexcept {
   if (detail::kImmediateFutureAlwaysDefer) {
+    new (&semi_) SemiFuture{std::move(value)};
     kind_ = Kind::SemiFuture;
-    new (&semi_) folly::SemiFuture<T>{std::move(value)};
   } else {
+    new (&immediate_) Try{std::move(value)};
     kind_ = Kind::Immediate;
-    new (&immediate_) folly::Try<T>{std::move(value)};
   }
 }
 
 template <typename T>
+ImmediateFuture<T>::ImmediateFuture(Empty) noexcept : kind_{Kind::Nothing} {}
+
+template <typename T>
 ImmediateFuture<T>::ImmediateFuture(
-    folly::SemiFuture<T>&& fut,
+    SemiFuture fut,
     SemiFutureReadiness readiness) noexcept {
   if (readiness == SemiFutureReadiness::LazySemiFuture) {
+    new (&semi_) folly::SemiFuture<T>{std::move(fut)};
     kind_ = Kind::LazySemiFuture;
-    new (&semi_) folly::SemiFuture<T>{std::move(fut)};
   } else if (!fut.isReady() || detail::kImmediateFutureAlwaysDefer) {
-    kind_ = Kind::SemiFuture;
     new (&semi_) folly::SemiFuture<T>{std::move(fut)};
+    kind_ = Kind::SemiFuture;
   } else {
+    new (&immediate_) Try{std::move(fut).getTry()};
     kind_ = Kind::Immediate;
-    new (&immediate_) folly::Try<T>{std::move(fut).getTry()};
   }
 }
 
@@ -63,44 +73,54 @@ ImmediateFuture<T>::~ImmediateFuture() {
 }
 
 template <typename T>
-ImmediateFuture<T>::ImmediateFuture(ImmediateFuture<T>&& other) noexcept(
-    std::is_nothrow_move_constructible_v<folly::Try<T>>)
-    : kind_(other.kind_) {
-  switch (kind_) {
+ImmediateFuture<T>::ImmediateFuture(ImmediateFuture&& other) noexcept {
+  // The unfortunate duplication between the following and destroy() is to avoid
+  // a redundant load and branch on other.kind_ when the compiler cannot see
+  // through the dataflow of T's move constructor.
+  switch (other.kind_) {
     case Kind::Immediate:
-      new (&immediate_) folly::Try<T>(std::move(other.immediate_));
+      new (&immediate_) Try{std::move(other.immediate_)};
+      kind_ = Kind::Immediate;
+      other.kind_ = Kind::Nothing;
+      other.immediate_.~Try();
       break;
     case Kind::SemiFuture:
     case Kind::LazySemiFuture:
-      new (&semi_) folly::SemiFuture<T>(std::move(other.semi_));
+      new (&semi_) SemiFuture{std::move(other.semi_)};
+      kind_ = other.kind_;
+      other.kind_ = Kind::Nothing;
+      other.semi_.~SemiFuture();
       break;
     case Kind::Nothing:
+      kind_ = Kind::Nothing;
       break;
   }
-  other.kind_ = Kind::Nothing;
 }
 
 template <typename T>
-ImmediateFuture<T>&
-ImmediateFuture<T>::operator=(ImmediateFuture<T>&& other) noexcept(
-    std::is_nothrow_move_constructible_v<folly::Try<T>>) {
-  if (this == &other) {
-    return *this;
-  }
+ImmediateFuture<T>& ImmediateFuture<T>::operator=(
+    ImmediateFuture&& other) noexcept {
   destroy();
+  // The unfortunate duplication between the following and destroy() is to avoid
+  // a redundant load and branch on other.kind_ when the compiler cannot see
+  // through the dataflow of T's move constructor.
   switch (other.kind_) {
     case Kind::Immediate:
-      new (&immediate_) folly::Try<T>(std::move(other.immediate_));
+      new (&immediate_) Try{std::move(other.immediate_)};
+      kind_ = Kind::Immediate;
+      other.kind_ = Kind::Nothing;
+      other.immediate_.~Try();
       break;
     case Kind::SemiFuture:
     case Kind::LazySemiFuture:
-      new (&semi_) folly::SemiFuture<T>(std::move(other.semi_));
+      new (&semi_) SemiFuture{std::move(other.semi_)};
+      kind_ = other.kind_;
+      other.kind_ = Kind::Nothing;
+      other.semi_.~SemiFuture();
       break;
     case Kind::Nothing:
       break;
   }
-  kind_ = other.kind_;
-  other.kind_ = Kind::Nothing;
   return *this;
 }
 
@@ -197,7 +217,7 @@ bool ImmediateFuture<T>::isReady() const {
     case Kind::LazySemiFuture:
       return false;
     case Kind::Nothing:
-      throw DestroyedImmediateFutureError{};
+      throw folly::FutureInvalid{};
   }
   folly::assume_unreachable();
 }
@@ -220,7 +240,7 @@ ImmediateFuture<T>::thenTry(Func&& func) && {
       return std::move(semiFut).deferValue(
           [](auto&& immFut) { return std::move(immFut).semi(); });
     } else {
-      return semiFut;
+      return std::move(semiFut);
     }
   }
 }
@@ -234,7 +254,7 @@ T ImmediateFuture<T>::get() && {
     case Kind::LazySemiFuture:
       return std::move(semi_).get();
     case Kind::Nothing:
-      throw DestroyedImmediateFutureError();
+      throw folly::FutureInvalid();
   }
   folly::assume_unreachable();
 }
@@ -248,7 +268,7 @@ folly::Try<T> ImmediateFuture<T>::getTry() && {
     case Kind::LazySemiFuture:
       return std::move(semi_).getTry();
     case Kind::Nothing:
-      throw DestroyedImmediateFutureError();
+      throw folly::FutureInvalid();
   }
   folly::assume_unreachable();
 }
@@ -262,7 +282,7 @@ T ImmediateFuture<T>::get(folly::HighResDuration timeout) && {
     case Kind::LazySemiFuture:
       return std::move(semi_).get(timeout);
     case Kind::Nothing:
-      throw DestroyedImmediateFutureError();
+      throw folly::FutureInvalid();
   }
   folly::assume_unreachable();
 }
@@ -276,7 +296,7 @@ folly::Try<T> ImmediateFuture<T>::getTry(folly::HighResDuration timeout) && {
     case Kind::LazySemiFuture:
       return std::move(semi_).getTry(timeout);
     case Kind::Nothing:
-      throw DestroyedImmediateFutureError();
+      throw folly::FutureInvalid();
   }
   folly::assume_unreachable();
 }
@@ -290,7 +310,7 @@ folly::SemiFuture<T> ImmediateFuture<T>::semi() && {
     case Kind::LazySemiFuture:
       return std::move(semi_);
     case Kind::Nothing:
-      throw DestroyedImmediateFutureError();
+      throw folly::FutureInvalid();
   }
   folly::assume_unreachable();
 }
@@ -383,38 +403,36 @@ collectAll(Fs&&... fs) {
     Result results;
   };
 
-  auto future = [&]() {
-    std::vector<folly::SemiFuture<folly::Unit>> semis;
+  std::vector<folly::SemiFuture<folly::Unit>> semis;
 
-    auto ctx = std::make_shared<Context>();
-    folly::futures::detail::foreach(
-        [&](auto i, auto&& f) {
-          if (f.isReady()) {
-            std::get<i.value>(ctx->results) = std::move(f).getTry();
-          } else {
-            semis.emplace_back(std::move(f).semi().defer([i, ctx](auto&& t) {
-              std::get<i.value>(ctx->results) = std::move(t);
-            }));
-          }
-        },
-        static_cast<Fs&&>(fs)...);
+  // TODO: fast-path the case where everything is ready and avoid allocations
+  // entirely.
+  auto ctx = std::make_shared<Context>();
+  folly::futures::detail::foreach(
+      [&](auto i, auto&& f) {
+        if (f.isReady()) {
+          std::get<i.value>(ctx->results) = std::move(f).getTry();
+        } else {
+          semis.emplace_back(std::move(f).semi().defer([i, ctx](auto&& t) {
+            std::get<i.value>(ctx->results) = std::move(t);
+          }));
+        }
+      },
+      static_cast<Fs&&>(fs)...);
 
-    if (semis.empty()) {
-      // Since all the ImmediateFuture were ready, the Context hasn't been
-      // copied to any lambdas, and thus will be destroyed once this lambda
-      // returns. This will make the returned SemiFuture ready which the
-      // ImmediateFuture constructor will extract the value from.
-      return ctx->p.getSemiFuture();
-    }
+  if (semis.empty()) {
+    // Since all the ImmediateFuture were ready, the Context hasn't been
+    // copied to any lambdas, and thus will be destroyed once this lambda
+    // returns. This will make the returned SemiFuture ready which the
+    // ImmediateFuture constructor will extract the value from.
+    auto fut = ctx->p.getSemiFuture();
+    ctx.reset();
+    return fut;
+  }
 
-    return folly::collectAll(std::move(semis)).deferValue([ctx](auto&&) {
-      return ctx->p.getSemiFuture();
-    });
-  }();
-
-  // The SemiFuture constructor will extract the immediate value if the future
-  // isReady returns true.
-  return future;
+  return folly::collectAll(std::move(semis)).deferValue([ctx](auto&&) {
+    return ctx->p.getSemiFuture();
+  });
 }
 
 template <typename... Fs>

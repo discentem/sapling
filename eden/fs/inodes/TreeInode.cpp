@@ -13,6 +13,7 @@
 #include <folly/futures/Future.h>
 #include <folly/io/async/EventBase.h>
 #include <folly/logging/xlog.h>
+#include <sys/stat.h>
 #include <vector>
 
 #include "eden/common/utils/Synchronized.h"
@@ -2389,7 +2390,7 @@ ImmediateFuture<Unit> TreeInode::diff(
   }
 
   InodePtr inode;
-  ImmediateFuture<InodePtr> gitignoreInodeFuture;
+  auto gitignoreInodeFuture = ImmediateFuture<InodePtr>::makeEmpty();
   vector<IncompleteInodeLoad> pendingLoads;
   {
     // We have to get a write lock since we may have to load
@@ -3015,7 +3016,7 @@ Future<Unit> TreeInode::checkout(
     actionFutures.emplace_back(action->run(ctx, &getObjectStore()));
   }
 
-  folly::SemiFuture<Unit> faultFuture =
+  ImmediateFuture<Unit> faultFuture =
       getMount()->getServerState()->getFaultInjector().checkAsync(
           "TreeInode::checkout", getLogPath(), ctx->isDryRun());
   folly::SemiFuture<vector<folly::Try<facebook::eden::InvalidationRequired>>>
@@ -3023,6 +3024,7 @@ Future<Unit> TreeInode::checkout(
 
   // Wait for all of the actions, and record any errors.
   return std::move(faultFuture)
+      .semi()
       .toUnsafeFuture()
       .thenValue([collectFuture = std::move(collectFuture)](auto&&) mutable {
         return std::move(collectFuture);
@@ -4167,20 +4169,22 @@ ImmediateFuture<std::vector<TreeInodePtr>> getLoadedOrRememberedTreeChildren(
 } // namespace
 
 ImmediateFuture<uint64_t> TreeInode::invalidateChildrenNotMaterialized(
+    std::chrono::system_clock::time_point cutoff,
     const ObjectFetchContextPtr& context) {
   return getLoadedOrRememberedTreeChildren(this, getInodeMap(), context)
-      .thenValue([context =
-                      context.copy()](std::vector<TreeInodePtr> treeChildren) {
+      .thenValue([context = context.copy(),
+                  cutoff](std::vector<TreeInodePtr> treeChildren) {
         std::vector<ImmediateFuture<uint64_t>> futures;
 
         for (auto& tree : treeChildren) {
-          futures.push_back(tree->invalidateChildrenNotMaterialized(context));
+          futures.push_back(
+              tree->invalidateChildrenNotMaterialized(cutoff, context));
         }
 
         return collectAllSafe(std::move(futures));
       })
-      .thenValue([self = inodePtrFromThis()](
-                     const std::vector<uint64_t>& invalidatedCounts) {
+      .thenValue([self = inodePtrFromThis(),
+                  cutoff](const std::vector<uint64_t>& invalidatedCounts) {
         uint64_t numInvalidated = 0;
         for (auto invalidated : invalidatedCounts) {
           numInvalidated += invalidated;
@@ -4188,6 +4192,14 @@ ImmediateFuture<uint64_t> TreeInode::invalidateChildrenNotMaterialized(
 
         std::vector<InodePtr> deletedInodes;
         {
+          AbsolutePath selfPath;
+          if (auto path = self->getPath()) {
+            selfPath = self->getMount()->getPath() + path.value();
+          } else {
+            // This directory was removed, no need to do anything.
+            return numInvalidated;
+          }
+
           auto* inodeMap = self->getInodeMap();
           auto contents = self->contents_.wlock();
           for (auto& entry : contents->entries) {
@@ -4204,6 +4216,33 @@ ImmediateFuture<uint64_t> TreeInode::invalidateChildrenNotMaterialized(
               continue;
             }
 
+#ifdef _WIN32
+            // Let's focus only on files as directories will get their atime
+            // updated when we query the atime of the files contained in it.
+            if (!entry.second.isDirectory()) {
+              auto entryPath = selfPath + entry.first;
+              auto wEntryPath = entryPath.wide();
+              struct __stat64 buf;
+
+              // TODO: If the file isn't on disk this will lay a placeholder on
+              // disk and at the same time force it to not be invalidated due
+              // to its atime being newer than the cutoff.
+              if (_wstat64(wEntryPath.c_str(), &buf) < 0) {
+                continue;
+              }
+
+              auto atime = std::chrono::system_clock::from_time_t(buf.st_atime);
+              if (atime > cutoff) {
+                // That file has been touched too recently, continue.
+                continue;
+              }
+            }
+#else
+            (void)cutoff;
+
+        // TODO(xavierd): read the atime from the InodeMetadata table.
+#endif
+
             // TODO: In the case where the file becomes materialized on disk
             // now, invalidateChannelEntryCache will happily remove it, leading
             // to a potential loss of user data. To avoid this, we could try
@@ -4213,7 +4252,9 @@ ImmediateFuture<uint64_t> TreeInode::invalidateChildrenNotMaterialized(
             // Here, we rely on invalidateChannelEntryCache failing for
             // non-empty directories to guarantee that we're not losing user
             // data in the case where a user writes a file in a directory that
-            // we're attempting to invalidate.
+            // we're attempting to invalidate. For directories with not
+            // invalidated childrens due to being read too recently, we also
+            // rely on invalidateChannelEntryCache failing.
             auto invalidateResult = self->invalidateChannelEntryCache(
                 *contents, entry.first, inodeNumber);
             if (invalidateResult.hasException()) {

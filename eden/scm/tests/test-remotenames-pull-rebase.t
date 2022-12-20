@@ -115,13 +115,6 @@ Tests the behavior of a pull followed by a pull --rebase
   adding manifests
   adding file changes
   $ hg debugmakepublic 4557926d2166
-  $ hg pull --rebase
-  pulling from $TESTTMP/remoterepo (glob)
-  searching for changes
-  no changes found
-  abort: can't rebase public changeset 4557926d2166
-  (see 'hg help phases' for details)
-  [255]
 
 Tests that there are no race condition between pulling changesets and remote bookmarks
   $ cd ..
@@ -161,7 +154,7 @@ Test pull with --rebase and --tool
   $ mkcommit remotecommit
   $ cd ../localrepo
   $ hg book -t default/bookmarkonremote -r default/bookmarkonremote tracking2
-  $ hg update tracking2 -q
+  $ hg goto tracking2 -q
   $ echo localchanges > editedbyboth
   $ hg add editedbyboth
   $ mkcommit somelocalchanges

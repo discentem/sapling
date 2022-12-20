@@ -24,15 +24,12 @@ use cached_config::ConfigHandle;
 use clap::Parser;
 use cloned::cloned;
 use cmdlib::args::CachelibSettings;
-use cmdlib::helpers::serve_forever;
-use cmdlib::monitoring::AliveService;
 use connection_security_checker::ConnectionSecurityChecker;
 use fbinit::FacebookInit;
 use filestore::FilestoreConfig;
 use futures::channel::oneshot;
-use futures::future::lazy;
-use futures::future::select;
-use futures::FutureExt;
+use futures::future::try_select;
+use futures::pin_mut;
 use futures::TryFutureExt;
 use gotham_ext::handler::MononokeHttpHandler;
 use gotham_ext::middleware::LoadMiddleware;
@@ -51,6 +48,7 @@ use mononoke_app::args::ReadonlyArgs;
 use mononoke_app::args::RepoFilterAppExtension;
 use mononoke_app::args::ShutdownTimeoutArgs;
 use mononoke_app::args::TLSArgs;
+use mononoke_app::fb303::AliveService;
 use mononoke_app::fb303::Fb303AppExtension;
 use mononoke_app::MononokeApp;
 use mononoke_app::MononokeAppBuilder;
@@ -96,6 +94,9 @@ pub struct Repo {
 
     #[init(repo_identity.name().to_string())]
     name: String,
+
+    #[facet]
+    repo_config: RepoConfig,
 
     #[facet]
     filestore_config: FilestoreConfig,
@@ -157,34 +158,18 @@ struct LfsServerArgs {
 
 #[derive(Clone)]
 pub struct LfsRepos {
-    pub(crate) app: Arc<MononokeApp>,
     pub(crate) repos: Arc<MononokeRepos<Repo>>,
 }
 
 impl LfsRepos {
-    pub(crate) async fn new(app: Arc<MononokeApp>) -> Result<Self> {
-        let repo_names = app
-            .repo_configs()
-            .repos
-            .iter()
-            .filter_map(|(name, config)| {
-                // Initialize repos that are enabled and not deep sharded
-                // (i.e. need to exist at service start-up)
-                if config.enabled && !config.deep_sharded {
-                    Some(name.to_string())
-                } else {
-                    None
-                }
-            })
-            .collect::<Vec<_>>();
-        let repos = app.open_mononoke_repos(repo_names).await?;
-        Ok(Self { app, repos })
+    pub(crate) async fn new(app: &MononokeApp) -> Result<Self> {
+        let repos_mgr = app.open_managed_repos().await?;
+        let repos = repos_mgr.repos().clone();
+        Ok(Self { repos })
     }
 
-    pub(crate) fn get(&self, repo_name: &str) -> Option<(Arc<Repo>, RepoConfig)> {
-        let repo = self.repos.get_by_name(repo_name);
-        let config = self.app.repo_config_by_name(repo_name).ok();
-        repo.and_then(|repo| config.map(|config| (repo, config)))
+    pub(crate) fn get(&self, repo_name: &str) -> Option<Arc<Repo>> {
+        self.repos.get_by_name(repo_name)
     }
 }
 
@@ -195,18 +180,15 @@ fn main(fb: FacebookInit) -> Result<(), Error> {
         ..Default::default()
     };
 
-    let app = Arc::new(
-        MononokeAppBuilder::new(fb)
-            .with_app_extension(Fb303AppExtension {})
-            .with_app_extension(RepoFilterAppExtension {})
-            .with_default_cachelib_settings(cachelib_settings)
-            .build::<LfsServerArgs>()?,
-    );
+    let app = MononokeAppBuilder::new(fb)
+        .with_app_extension(Fb303AppExtension {})
+        .with_app_extension(RepoFilterAppExtension {})
+        .with_default_cachelib_settings(cachelib_settings)
+        .build::<LfsServerArgs>()?;
 
     let args: LfsServerArgs = app.args()?;
 
     let logger = app.logger().clone();
-    let runtime = app.runtime();
     let config_store = app.config_store();
     let acl_provider = app.environment().acl_provider.clone();
 
@@ -262,12 +244,16 @@ fn main(fb: FacebookInit) -> Result<(), Error> {
         LogMiddleware::slog(logger.clone())
     };
 
+    app.start_monitoring(SERVICE_NAME, AliveService)?;
+    app.start_stats_aggregation()?;
+
     let common = &app.repo_configs().common;
     let internal_identity = common.internal_identity.clone();
+    let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
     let server = {
-        cloned!(acl_provider, common, logger, will_exit, app);
-        async move {
-            let repos = LfsRepos::new(app)
+        cloned!(acl_provider, common, logger, will_exit);
+        move |app| async move {
+            let repos = LfsRepos::new(&app)
                 .await
                 .context(Error::msg("Error opening repos"))?;
 
@@ -353,47 +339,47 @@ fn main(fb: FacebookInit) -> Result<(), Error> {
                 writer.write_all(b"\n")?;
             }
 
-            if let Some(tls_acceptor) = tls_acceptor {
-                let connection_security_checker =
-                    ConnectionSecurityChecker::new(acl_provider.as_ref(), &common).await?;
+            let serve = async move {
+                if let Some(tls_acceptor) = tls_acceptor {
+                    let connection_security_checker =
+                        ConnectionSecurityChecker::new(acl_provider.as_ref(), &common).await?;
 
-                serve::https(
-                    logger,
-                    listener,
-                    tls_acceptor,
-                    capture_session_data,
-                    connection_security_checker,
-                    handler,
-                )
-                .await
-            } else {
-                serve::http(logger, listener, handler).await
-            }
+                    serve::https(
+                        logger,
+                        listener,
+                        tls_acceptor,
+                        capture_session_data,
+                        connection_security_checker,
+                        handler,
+                    )
+                    .await
+                } else {
+                    serve::http(logger, listener, handler).await
+                }
+            };
+            pin_mut!(serve);
+            try_select(
+                serve,
+                shutdown_rx.map_err(|err| anyhow!("Cancelled channel: {}", err)),
+            )
+            .await
+            .map_err(|e| futures::future::Either::factor_first(e).0)?;
+            Ok(())
         }
     };
 
-    let fb303_args = app.extension_args::<Fb303AppExtension>()?;
-    fb303_args.start_fb303_server(fb, SERVICE_NAME, &logger, AliveService)?;
-
-    let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
-    serve_forever(
-        runtime,
-        select(
-            server.boxed(),
-            shutdown_rx.map_err(|err| anyhow!("Cancelled channel: {}", err)),
-        )
-        .map(|res| res.factor_first().0),
-        &logger,
+    app.run_until_terminated(
+        server,
         move || will_exit.store(true, Ordering::Relaxed),
         args.shutdown_timeout_args.shutdown_grace_period,
-        lazy(move |_| {
+        async move {
             let _ = shutdown_tx.send(());
             // Currently we kill off in-flight requests as soon as we've closed the listener.
             // If this is a problem in prod, this would be the point at which to wait
             // for all connections to shut down.
             // To do this properly, we'd need to track the `Connection` futures that Gotham
             // gets from Hyper, tell them to gracefully shutdown, then wait for them to complete
-        }),
+        },
         args.shutdown_timeout_args.shutdown_timeout,
     )?;
 

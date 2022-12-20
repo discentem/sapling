@@ -10,8 +10,9 @@
 #include <folly/portability/GTest.h>
 #include <folly/test/TestUtils.h>
 
-namespace facebook::eden {
+namespace {
 
+using namespace facebook::eden;
 using namespace std::literals::chrono_literals;
 
 TEST(ImmediateFuture, get) {
@@ -184,7 +185,7 @@ TEST(ImmediateFuture, defaultCtor) {
   });
   EXPECT_EQ(std::move(fortyThree).get(), 43);
 
-  ImmediateFuture<int> defaultCtor{};
+  ImmediateFuture<int> defaultCtor{std::in_place};
   auto one =
       std::move(defaultCtor).thenValue([](auto&& zero) { return zero + 1; });
   EXPECT_EQ(std::move(one).get(), 1);
@@ -290,6 +291,7 @@ TEST(ImmediateFuture, collectAllImmediate) {
   vec.push_back(ImmediateFuture<int>{43});
 
   auto fut = collectAll(std::move(vec));
+  EXPECT_NE(fut.debugIsImmediate(), detail::kImmediateFutureAlwaysDefer);
   EXPECT_NE(fut.isReady(), detail::kImmediateFutureAlwaysDefer);
   auto res = std::move(fut).get();
   EXPECT_EQ(*res[0], 42);
@@ -378,6 +380,7 @@ TEST(ImmediateFuture, collectAllTuple) {
   auto f2 = ImmediateFuture<float>{42.f};
 
   auto future = collectAll(std::move(f1), std::move(f2));
+  EXPECT_NE(future.debugIsImmediate(), detail::kImmediateFutureAlwaysDefer);
   EXPECT_NE(future.isReady(), detail::kImmediateFutureAlwaysDefer);
 
   auto res = std::move(future).get();
@@ -410,6 +413,7 @@ TEST(ImmediateFuture, collectAllTupleSemiReady) {
   promise2.setValue(43);
 
   auto future = collectAll(std::move(f1), std::move(f2));
+  EXPECT_NE(future.debugIsImmediate(), detail::kImmediateFutureAlwaysDefer);
   EXPECT_NE(future.isReady(), detail::kImmediateFutureAlwaysDefer);
 
   auto res = std::move(future).get(1ms);
@@ -423,6 +427,7 @@ TEST(ImmediateFuture, collectAllSafeTuple) {
       folly::Try<float>{std::logic_error("Test exception")}};
 
   auto future = collectAllSafe(std::move(f1), std::move(f2));
+  EXPECT_NE(future.debugIsImmediate(), detail::kImmediateFutureAlwaysDefer);
   EXPECT_NE(future.isReady(), detail::kImmediateFutureAlwaysDefer);
 
   EXPECT_THROW_RE(std::move(future).get(), std::logic_error, "Test exception");
@@ -611,4 +616,108 @@ TEST(ImmediateFuture, constructionFromCompatible) {
       });
 }
 
-} // namespace facebook::eden
+struct Counted {
+  explicit Counted(size_t* count) noexcept : count{count} {
+    ++*count;
+  }
+  Counted(const Counted& c) noexcept : count{c.count} {
+    ++*count;
+  }
+  Counted(Counted&& c) noexcept : count{c.count} {
+    ++*count;
+  }
+  ~Counted() {
+    --*count;
+  }
+
+  Counted& operator=(const Counted&) noexcept {
+    return *this;
+  }
+  Counted& operator=(Counted&&) noexcept {
+    return *this;
+  }
+
+  size_t* count;
+};
+
+TEST(ImmediateFuture, destructors_are_called_by_ImmediateFuture_move) {
+  size_t count = 0;
+  {
+    ImmediateFuture<Counted> p{Counted{&count}};
+    EXPECT_EQ(1, count);
+
+    ImmediateFuture<Counted> q{std::move(p)};
+    EXPECT_EQ(1, count);
+
+    p = std::move(q);
+    EXPECT_EQ(1, count);
+
+    p = std::move(*&p);
+  }
+
+  EXPECT_EQ(0, count);
+}
+
+TEST(ImmediateFuture, invalid_if_makeEmpty) {
+  EXPECT_FALSE(ImmediateFuture<int>::makeEmpty().valid());
+}
+
+TEST(ImmediateFuture, invalid_if_moved_from) {
+  ImmediateFuture<int> f{10};
+  EXPECT_TRUE(f.valid());
+  auto p = std::move(f);
+  EXPECT_TRUE(p.valid());
+  EXPECT_FALSE(f.valid());
+}
+
+TEST(ImmediateFuture, in_place_construction) {
+  size_t count = 0;
+  ImmediateFuture<Counted> p{std::in_place, &count};
+  EXPECT_EQ(1, count);
+}
+
+TEST(ImmediateFuture, in_place_construction_multiple_arguments) {
+  using StringPtr = std::unique_ptr<std::string>;
+  ImmediateFuture<std::pair<StringPtr, StringPtr>> p{
+      std::in_place,
+      std::make_unique<std::string>("hello"),
+      std::make_unique<std::string>("world")};
+  auto result = std::move(p).get();
+  EXPECT_EQ("hello", *result.first);
+  EXPECT_EQ("world", *result.second);
+}
+
+TEST(ImmediateFuture, conversion_from_ready_Future) {
+  auto fut = folly::makeFuture<int>(10);
+  // use = to ensure we can implicitly convert
+  ImmediateFuture<int> imm = std::move(fut);
+  EXPECT_FALSE(fut.valid());
+  EXPECT_TRUE(imm.valid());
+  EXPECT_NE(imm.isReady(), detail::kImmediateFutureAlwaysDefer);
+  EXPECT_EQ(10, std::move(imm).get());
+}
+
+TEST(ImmediateFuture, conversion_from_nonready_Future) {
+  folly::Promise<int> p;
+  auto fut = p.getFuture();
+  // use = to ensure we can implicitly convert
+  ImmediateFuture<int> imm = std::move(fut);
+  EXPECT_FALSE(fut.valid());
+  EXPECT_TRUE(imm.valid());
+  EXPECT_FALSE(imm.isReady());
+  p.setValue(10);
+  EXPECT_NE(imm.isReady(), detail::kImmediateFutureAlwaysDefer);
+  EXPECT_EQ(10, std::move(imm).get());
+}
+
+TEST(ImmediateFuture, then_with_Future) {
+  ImmediateFuture<int> imm = 10;
+  auto result = std::move(imm).thenValue([](int i) {
+    // It's funny to std::move() an int, but it's required to match makeFuture's
+    // type signature.
+    return folly::makeFuture<int>(std::move(i));
+  });
+  EXPECT_EQ(10, std::move(result).get());
+}
+
+} // namespace
