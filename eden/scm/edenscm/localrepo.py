@@ -2509,9 +2509,10 @@ class localrepository(object):
 
         return fparent1
 
-    def _filecommitgit(self, fctx):
-        if fctx.flags() == "m":
-            return fctx.filenode()
+    def _filecommitgit(self, fctx) -> bytes:
+        fnode = git.submodule_node_from_fctx(fctx)
+        if fnode is not None:
+            return fnode
         return self.fileslog.contentstore.writeobj("blob", fctx.data())
 
     def checkcommitpatterns(self, wctx, match, status, fail):

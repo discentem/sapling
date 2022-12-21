@@ -1586,7 +1586,7 @@ def batchremove(repo, wctx, actions):
         )
 
 
-def updateone(repo, fctx, wctx, f, flags, backup=False, backgroundclose=False):
+def updateone(repo, fctxfunc, wctx, f, flags, backup=False, backgroundclose=False):
     if backup:
         # If a file or directory exists with the same name, back that
         # up.  Otherwise, look to see if there is a file that conflicts
@@ -1600,8 +1600,13 @@ def updateone(repo, fctx, wctx, f, flags, backup=False, backgroundclose=False):
         orig = scmutil.origpath(repo.ui, repo, absf)
         if repo.wvfs.lexists(absf):
             util.rename(absf, orig)
+    fctx = fctxfunc(f)
+    if fctx.flags() == "m" and not wctx.isinmemory():
+        # Do not handle submodules for on-disk checkout here.
+        # They are handled separately.
+        return 0
     wctx[f].clearunknown()
-    data = fctx(f).data()
+    data = fctx.data()
     wctx[f].write(data, flags, backgroundclose=backgroundclose)
 
     return len(data)
@@ -1686,6 +1691,9 @@ def applyupdates(repo, actions, wctx, mctx, overwrite, labels=None, ancestors=No
         else:
             # TODO: move to absentfilectx
             fca = repo.filectx(f1, changeid=nullid, fileid=nullid)
+        # Skip submodules for now
+        if fcl.flags() == "m" or fco.flags() == "m":
+            continue
         ms.add(fcl, fco, fca, f)
         if f1 != f and move:
             moves.append(f1)
@@ -1925,7 +1933,16 @@ def applyupdates(repo, actions, wctx, mctx, overwrite, labels=None, ancestors=No
                 repo.ui.debug(" %s: %s -> m (premerge)\n" % (f, msg))
                 z += 1
                 prog.value = (z, f)
-                wctx[f].audit()
+                wfctx = wctx[f]
+                wfctx.audit()
+                # Skip submodules for now
+                try:
+                    if wfctx.flags() == "m":
+                        continue
+                except error.ManifestLookupError:
+                    # Cannot check the flags - ignore.
+                    # This code path is hit by test-rebase-inmemory-conflicts.t.
+                    pass
                 complete, r = ms.preresolve(f, wctx)
                 if not complete:
                     numupdates += 1
@@ -2663,7 +2680,13 @@ def update(
 
     if not partial:
         if git.isgitformat(repo) and not wc.isinmemory():
-            git.submodulecheckout(p2, matcher, force=force)
+            if branchmerge:
+                ctx = p1
+                mctx = p2
+            else:
+                ctx = p2
+                mctx = None
+            git.submodulecheckout(ctx, matcher, force=force, mctx=mctx)
         repo.hook("update", parent1=xp1, parent2=xp2, error=stats[3])
 
     # Log the number of files updated.
