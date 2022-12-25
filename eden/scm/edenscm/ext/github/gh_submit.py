@@ -103,6 +103,7 @@ class PullRequestDetails:
     #   bodyText: plaintext version of body with Markdown markup removed
     #   bodyHTML: body rendered as "safe" HTML
     body: str
+    state: str
 
 
 async def get_pull_request_details(
@@ -129,6 +130,7 @@ async def get_pull_request_details(
             head_oid=data["headRefOid"],
             head_branch_name=data["headRefName"],
             body=data["body"],
+            state=data["state"]
         )
     )
 
