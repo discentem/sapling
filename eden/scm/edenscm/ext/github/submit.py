@@ -176,7 +176,10 @@ async def update_commits_in_stack(
         pr = commit.pr
         if pr:
             if pr.head_oid == hex(commit.node):
-                ui.status_err(_("#%d is up-to-date\n") % pr.number)
+                if commit.pr.state == "CLOSED":
+                    ui.status_err(_("%s was closed.\n" % commit.pr.url))
+                else:
+                    ui.status_err(_("#%d is up-to-date\n") % pr.number)
             else:
                 refs_to_update.append(
                     f"{hex(commit.node)}:refs/heads/{pr.head_branch_name}"
