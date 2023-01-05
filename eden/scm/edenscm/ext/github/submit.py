@@ -288,7 +288,9 @@ async def rewrite_pull_request_body(
         pr_numbers_and_num_commits,
         index,
         repository,
+        review_stack=ui.configbool("review_stack_tag", "false")
     )
+    breakpoint()
     pr = head_commit_data.pr
     assert pr
     result = await gh_submit.update_pull_request(
