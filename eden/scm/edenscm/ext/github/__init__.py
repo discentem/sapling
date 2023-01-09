@@ -7,10 +7,14 @@
 """
 
 import shutil
-from typing import Optional
+import asyncio
+from typing import Optional, List
 
-from edenscm import error, registrar, util
+from edenscm import error, registrar, util, cmdutil
 from edenscm.i18n import _
+from .pullrequeststore import PullRequestStore
+from edenscm.ext.github.submit import CommitData, derive_commit_data
+from edenscm.ext.smartlog import getdag, getrevs
 
 from . import (
     follow,
@@ -35,7 +39,7 @@ def extsetup(ui):
 @command(
     "pr",
     [],
-    _("<submit|get|link|unlink|...>"),
+    _("<submit|get|link|unlink|land|...>"),
 )
 def pull_request_command(ui, repo, *args, **opts):
     """exchange local commit data with GitHub pull requests"""
@@ -50,7 +54,7 @@ subcmd = pull_request_command.subcommand(
     categories=[
         (
             "Create or update pull requests, using `pull` to import a PR, if necessary",
-            ["submit", "pull"],
+            ["submit", "pull", "land"],
         ),
         (
             "Manually manage associations with pull requests",
@@ -78,6 +82,66 @@ def submit_cmd(ui, repo, *args, **opts):
     """create or update GitHub pull requests from local commits"""
     return submit.submit(ui, repo, *args, **opts)
 
+async def getCommitData(ui, repo, *args, **opts) -> List[List[CommitData]]:
+    store = PullRequestStore(repo)
+    commits_to_process = await asyncio.gather(
+        *[
+            derive_commit_data(node, repo, store)
+            for node in repo.nodes("all()")
+        ]
+    )
+    if not commits_to_process:
+        ui.status_err(_("no commits to submit\n"))
+        return 0
+
+    # Partition the chain.
+    partitions: List[List[CommitData]] = []
+    for commit in commits_to_process:
+        if commit.is_dep:
+            if partitions:
+                partitions[-1].append(commit)
+            else:
+                # If the top of the stack is a "dep commit", then do not
+                # submit it.
+                continue
+        else:
+            partitions.append([commit])
+    return partitions
+
+@subcmd(
+    "l|land",
+    [
+        (
+            "n",
+            "number",
+            0,
+            _("PR to land"),
+        )
+    ],
+)
+def land_cmd(ui, repo, *args, **opts):
+    cd = asyncio.run(
+        getCommitData(ui, repo, *args, **opts)
+    )
+    """
+    [[CommitData(node=b'L\xfd\xea\xedJ\x041\xa8\x82p\x0e\xb7\xa0\xbf\xec\x12\xeb(\x8b<', head_branch_name=None, pr=None, ctx=<changectx 4cfdeaed4a04>, is_dep=False, msg='Create README.md')], [CommitData(node=b'u+\x90\xac\x7f\xb5s\xd7\xce\xfa\n\xa5\xf2j\xd8\xe2\xce\xc8\x13\x90', head_branch_name=None, pr=None, ctx=<changectx 752b90ac7fb5>, is_dep=False, msg='initial html parsing and tests\n')], [CommitData(node=b'\x1b\x8dn\xe1\x888\x02\xc5\xfe`\xb1\xb8z\xf0&\xbc\xbd*\x9b\xe7', head_branch_name=None, pr=None, ctx=<changectx 1b8d6ee18838>, is_dep=False, msg='Merge pull request #3 from discentem/pr3\n\ninitial html parsing and tests')], [CommitData(node=b'\xb9\x82\x12f\xe1\xc1</H\xa2)[\xc8\r\x13\xd2\xad\xb8\t\xe2', head_branch_name=None, pr=None, ctx=<changectx b9821266e1c1>, is_dep=False, msg='adds fake graphql and graphql query test\n')], [CommitData(node=b'Plbh5\xdcN1V\x91\x13\xe5!fN\xa7\x81\x88\x1b\r', head_branch_name=None, pr=None, ctx=<changectx 506c626835dc>, is_dep=False, msg='webhook\n')], [CommitData(node=b'X\xca9\xfc\xd0\xb4*\xac\xfaH\xa5\xc6\xaa)\xdb\xb7\x89\xe3\x01\x84', head_branch_name=None, pr=None, ctx=<changectx 58ca39fcd0b4>, is_dep=False, msg='adds webhook scaffolding\n')], [CommitData(node=b'\x89\xd4\xf2=\xbe2\xe9\x96b[\x96\xa4"\x8f\x10+\x9e\x84e"', head_branch_name=None, pr=None, ctx=<changectx 89d4f23dbe32>, is_dep=False, msg='add more stack parsing and tests\n')], [CommitData(node=b'<J\xd9\xacK\xe8\xc8\x99\x91\x00\xa7t\x8c=n\xb6\xe1Q\x06\xb4', head_branch_name=None, pr=None, ctx=<changectx 3c4ad9ac4be8>, is_dep=False, msg='Merge pull request #9 from discentem/pr9\n\nadd more stack parsing and tests')], [CommitData(node=b'\xa6\xdfhU\x06\xad\x02M\x9a\rtUe5\x88\x8e\xf6\x9c\x00\xb7', head_branch_name=None, pr=None, ctx=<changectx a6df685506ad>, is_dep=False, msg='Merge pull request #12 from discentem/pr8\n\nPr8')], [CommitData(node=b'\xf6\xa6\x12K\x12\x8c[*\xedZ}\x9e\xa7\x00\xb5twt\xea\x1b', head_branch_name=None, pr=None, ctx=<changectx f6a6124b128c>, is_dep=False, msg='fix TestPRNumFromLine\n')], [CommitData(node=b'4\x94\xa3\xdd\xeax\x98\xbc1\xe0k\xf4\xd3\xc8\xce\xe9\xfdf\xb5\xa6', head_branch_name=None, pr=None, ctx=<changectx 3494a3ddea78>, is_dep=False, msg='Merge pull request #13 from discentem/pr13\n\nfix TestPRNumFromLine')], [CommitData(node=b'\x165X\xf3\x18\xc9n\xc1\x83o=\xc9#\xf1\x83\x1f\x83\xc9n\x90', head_branch_name=None, pr=None, ctx=<changectx 163558f318c9>, is_dep=False, msg='more tests\n')], [CommitData(node=b'\xe9\xa1\x86\x02\xec8\xbb\x9a\x1dl\x14j\xe1\x82\xc5\xc0p\xda\x1a\x84', head_branch_name=None, pr=None, ctx=<changectx e9a18602ec38>, is_dep=False, msg='Merge pull request #14 from discentem/pr14\n\nmore tests')], [CommitData(node=b'(T!\xae\x83Y\x8c\x83p\x81\x97\x84\xb1\xfa\xb4o\x04\x81\x10K', head_branch_name='pr15', pr=PullRequestDetails(node_id='PR_kwDOIsewis5G8yRN', number=15, url='https://github.com/discentem/arborlocker/pull/15', base_oid='e9a18602ec38bb9a1d6c146ae182c5c070da1a84', base_branch_name='main', head_oid='285421ae83598c8370819784b1fab46f0481104b', head_branch_name='pr15', body='fmt.print\n\n---\nStack created with [Sapling](https://sapling-scm.com). Best reviewed with [ReviewStack](https://reviewstack.dev/discentem/arborlocker/pull/15).\n* #16\n* __->__ #15\n'), ctx=<changectx 285421ae8359>, is_dep=False, msg=None)], [CommitData(node=b'~\xb7\xd8\xff\xa1\x81DC\xa3K\xaf\x81\xf9~\xb1\xd6\xb8\x9fI\xbf', head_branch_name='pr16', pr=PullRequestDetails(node_id='PR_kwDOIsewis5G8yoB', number=16, url='https://github.com/discentem/arborlocker/pull/16', base_oid='285421ae83598c8370819784b1fab46f0481104b', base_branch_name='pr15', head_oid='7eb7d8ffa1814443a34baf81f97eb1d6b89f49bf', head_branch_name='pr16', body='moar printing\n\n---\nStack created with [Sapling](https://sapling-scm.com). Best reviewed with [ReviewStack](https://reviewstack.dev/discentem/arborlocker/pull/16).\n* __->__ #16\n* #15\n'), ctx=<changectx 7eb7d8ffa181>, is_dep=False, msg=None)]]
+    """
+
+    breakpoint()
+    """Land a pull request from the commandline"""
+    
+
+   
+    breakpoint()
+    raise error.Abort(_("pr land is not implemented yet"))
+
+    # Check if pr.land.mergestrategy == top, if not abort (only supported strategy for now)
+    # Get list of PRs (1,2, 3)
+    # Leave comment on each of the PRs, except top. For (1,2,3) leave comments on 1 & 2.
+     # Comment mentions this are closed and folded into #3
+     # if any comment fails, undo previous comments
+    # Close 1,2
+    # merge 3
 
 @subcmd(
     "pull",
