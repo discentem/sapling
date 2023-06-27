@@ -6,17 +6,20 @@
 import re
 from typing import List, Tuple
 
+import edenscm.ui as uimod
+from edenscm.cmdutil import rendertemplate
 from .gh_submit import Repository
 
 _HORIZONTAL_RULE = "---"
 
 
 def create_pull_request_title_and_body(
+    ui: uimod,
     commit_msg: str,
     pr_numbers_and_num_commits: List[Tuple[int, int]],
     pr_numbers_index: int,
     repository: Repository,
-    reviewstack: bool = True,
+    template: str,
 ) -> Tuple[str, str]:
     r"""Returns (title, body) for the pull request.
 
@@ -63,22 +66,35 @@ def create_pull_request_title_and_body(
     """
     owner, name = repository.get_upstream_owner_and_name()
     pr = pr_numbers_and_num_commits[pr_numbers_index][0]
-    title = firstline(commit_msg)
-    body = commit_msg
-    extra = []
-    if len(pr_numbers_and_num_commits) > 1:
-        if reviewstack:
-            reviewstack_url = f"https://reviewstack.dev/{owner}/{name}/pull/{pr}"
-            review_stack_message = f"Stack created with [Sapling](https://sapling-scm.com). Best reviewed with [ReviewStack]({reviewstack_url})."
-            extra.append(review_stack_message)
-        bulleted_list = "\n".join(
+    reviewstack_url = f"https://reviewstack.dev/{owner}/{name}/pull/{pr}"
+    if not template:
+        body = r'''
+{commit_msg}
+{horizontal_rule}
+Stack created with [Sapling](https://sapling-scm.com). Best reviewed with [ReviewStack]({reviewstack_url}). 
+{bulleted_list}'''
+    else:
+        body = template
+    bulleted_list = "\n".join(
+        [
             _format_stack_entry(pr_number, index, pr_numbers_index, num_commits)
             for index, (pr_number, num_commits) in enumerate(pr_numbers_and_num_commits)
-        )
-        extra.append(bulleted_list)
-    if extra:
-        body = "\n".join([body, _HORIZONTAL_RULE] + extra)
-    return title, body
+        ]
+    )
+    title = firstline(commit_msg)
+    renderedbody = rendertemplate(
+        ui,
+        body,
+        {
+            'commit_msg': commit_msg,
+            'horizontal_rule': _HORIZONTAL_RULE,
+            'reviewstack_url': reviewstack_url,
+            'bulleted_list': bulleted_list
+        }
+    )
+    ui.write(renderedbody)
+    breakpoint()
+    return title, renderedbody
 
 
 _STACK_ENTRY = re.compile(r"^\* (__->__ )?#([1-9]\d*).*$")
